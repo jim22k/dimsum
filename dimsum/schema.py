@@ -4,6 +4,10 @@ import numpy as np
 import pandas as pd
 
 
+class SchemaMismatchError(Exception):
+    pass
+
+
 class Dimension:
     def __init__(self, name, allowed_values, ordered=True):
         self.name = name
@@ -39,7 +43,7 @@ class Dimension:
 class Schema:
     def __init__(self, dimensions):
         self._dimensions = tuple(dimensions)
-        self._names = tuple(dim.name for dim in dimensions)
+        self.names = tuple(dim.name for dim in dimensions)
         self._lookup = {dim.name: dim for dim in dimensions}
 
         if len(self._lookup) < len(self._dimensions):
@@ -63,8 +67,13 @@ class Schema:
     def __len__(self):
         return len(self._dimensions)
 
-    def __getitem__(self, name):
-        return self._lookup[name]
+    def __getitem__(self, key):
+        if type(key) is int:
+            return self._dimensions[key]
+        return self._lookup[key]
+
+    def __iter__(self):
+        return iter(self._dimensions)
 
     def __repr__(self):
         r = ['Schema:']
@@ -95,7 +104,7 @@ class Schema:
 
     def decode_one(self, code, names: Optional[Tuple[str]] = None) -> dict:
         if names is None:
-            names = self._names
+            names = self.names
         values = {}
         for name in names:
             dim = self._lookup[name]
@@ -107,7 +116,7 @@ class Schema:
 
     def decode_many(self, array: np.ndarray, names: Optional[Tuple[str]] = None) -> pd.DataFrame:
         if names is None:
-            names = self._names
+            names = self.names
         df = pd.DataFrame()
         for name in names:
             dim = self._lookup[name]
@@ -116,7 +125,6 @@ class Schema:
             index = (array & mask) >> offset
             df[name] = dim.pos2val[index].values
         return df
-
 
     def dims_to_mask(self, dims: Set[str]) -> int:
         mask = 0
