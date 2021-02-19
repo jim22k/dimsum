@@ -4,6 +4,9 @@ import numpy as np
 import pandas as pd
 
 
+NULL_KEY = "∅"  # \u2205
+
+
 class SchemaMismatchError(Exception):
     pass
 
@@ -14,13 +17,23 @@ class Dimension:
         self.ordered = ordered
 
         values = tuple(allowed_values)
-        lookup = {v: i for i, v in enumerate(values)}
+        lookup = {v: i for i, v in enumerate(values, 1)}
 
         if len(values) <= 0:
             raise ValueError("allowed_values is empty")
 
         if len(lookup) < len(values):
             raise ValueError("duplicate values")
+
+        if None in lookup:
+            raise ValueError("`None` is not an allowable value")
+
+        if NULL_KEY in lookup:
+            raise ValueError("NULL_KEY (∅) is not an allowable value")
+
+        # Add in NULL key (Python `None`), always at the zero bit value
+        values = (NULL_KEY,) + values
+        lookup[NULL_KEY] = 0
 
         self.values = values
         self.lookup = lookup

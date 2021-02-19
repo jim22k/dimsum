@@ -80,14 +80,14 @@ class Flat:
         return Pivot(matrix, self.schema, left, top)
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame, dims: List[str], value_column: str, schema: Schema) -> "Flat":
+    def from_dataframe(cls, df: pd.DataFrame, schema: Schema, dims: List[str], value_column: str) -> "Flat":
         """
         Converts a DataFrame to a Flat by indicating the dimensions and value column
 
         :param df: pd.DataFrame
+        :param schema: Schema
         :param dims: List[str] list of column headers
         :param value_column: str column header
-        :param schema: Schema
         :return: Flat
         """
         index = schema.encode_many(df[dims])
@@ -118,7 +118,7 @@ class Flat:
                 raise TypeError(err_msg)
             dims = [s.index.name]
         df = s.to_frame("* value *").reset_index()
-        return cls.from_dataframe(df, dims, "* value *", schema)
+        return cls.from_dataframe(df, schema, dims, "* value *")
 
     def to_series(self) -> pd.Series:
         """
