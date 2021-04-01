@@ -1,90 +1,169 @@
 import grblas
 import numba
 import numpy as np
+from typing import Union, Tuple
 from .container import Flat, Pivot
 from .schema import SchemaMismatchError
-
-
-class AlreadyAlignedError(Exception):
-    pass
+from .oputils import jitted_op
 
 
 class SizeMismatchError(Exception):
     pass
 
 
-def align(a: Flat, b: Flat) -> (Pivot, Pivot):
+# Sentinel to indicate the fill values come from the object to which we are aligning
+_fill_like = object()
+
+
+def align(a: Flat, b: Flat, operator=None, afill=None, bfill=None):
     """
     Aligns two Flats, returning two Pivots with matching left and top dimensions.
-    If the two input Flats already have matching dimensions, raises AlreadyAlignedError
+
+    If a and b are already aligned, returns Flats instead of Pivots.
+
+    If operator is provided, returns a single Pivot. Otherwise returns a 2-tuple of Pivots
+
+    afill and bfill are used to determine the kind of alignment
+    afill=None, bfill=None -> inner join
+    afill!=None, bfill=None -> left join
+    afill=None, bfill!=None -> right join
+    afill!=None, bfill!=None -> outer join
 
     :param a: Flat
     :param b: Flat
-    :return: (Pivot, Pivot)
+    :param operator: grblas.BinaryOp (default None)
+    :param afill: scalar or Flat (default None)
+    :param bfill: scalar or Flat (default None)
+    :return: Pivot or (Pivot, Pivot)
     """
     if a.schema is not b.schema:
         raise SchemaMismatchError("Objects have different schemas")
 
-    mismatched_dims = a.dims ^ b.dims
-    if not mismatched_dims:
-        raise AlreadyAlignedError("Inputs already have fully aligned dimensions")
+    if afill is not None and afill is b:
+        afill = _fill_like
+    if bfill is not None and bfill is a:
+        bfill = _fill_like
 
     # Determine which object is a subset of the other, or if they are fully disjoint
-    if a.dims - b.dims == mismatched_dims:
-        # b is the subset
+    mismatched_dims = a.dims ^ b.dims
+    if not mismatched_dims:
+        result = _already_aligned(a, b, operator, afill, bfill)
+    elif a.dims - b.dims == mismatched_dims:  # b is the subset
         a = a.pivot(top=mismatched_dims)
-        b = _align_subset(a, b)
-    elif b.dims - a.dims == mismatched_dims:
-        # a is the subset
+        result = _align_subset(a, b, operator, afill, bfill)
+    elif b.dims - a.dims == mismatched_dims:  # a is the subset
         b = b.pivot(top=mismatched_dims)
-        a = _align_subset(b, a)
-    else:
-        # disjoint
+        result = _align_subset(b, a, operator, bfill, afill, reversed=True)
+    else:  # disjoint
         matched_dims = a.dims & b.dims
         if matched_dims:  # partial disjoint
             a = a.pivot(left=matched_dims)
             b = b.pivot(left=matched_dims)
-            a, b = _align_partial_disjoint(a, b)
+            result = _align_partial_disjoint(a, b, operator, afill, bfill)
         else:  # full disjoint
-            a, b = _align_fully_disjoint(a, b)
-    return a, b
+            result = _align_fully_disjoint(a, b, operator)
+    return result
 
 
-def _align_subset(x: Pivot, sub: Flat) -> Pivot:
+def _already_aligned(a: Flat, b: Flat, op=None, afill=None, bfill=None) -> Union[Flat, Tuple[Flat, Flat]]:
+    # Create a2 and b2 as expanded, filled vectors
+    a2, b2 = a.vector, b.vector
+    if afill is _fill_like:
+        a2 = a2.dup()
+        a2(~a2.S) << b2
+    elif afill is not None:
+        a2 = grblas.Vector.new(a2.dtype, size=a2.size)
+        a2(b2.S) << afill
+        a2(a.vector.S) << a.vector
+
+    if bfill is _fill_like:
+        b2 = b2.dup()
+        b2(~b2.S) << a2
+    elif bfill is not None:
+        b2 = grblas.Vector.new(b2.dtype, size=b2.size)
+        b2(a2.S) << bfill
+        b2(b.vector.S) << b.vector
+
+    # Handle op
+    if op is None:
+        return Flat(a2, a.schema, a.dims), Flat(b2, b.schema, b.dims)
+    else:
+        result = a2.ewise_mult(b2, op=op)
+        # Save result over a2, but don't modify the original input
+        if afill is None:
+            a2 = result.new()
+        else:
+            a2 << result
+        return Flat(a2, a.schema, a.dims)
+
+
+def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed=False) -> Union[Pivot, Tuple[Pivot, Pivot]]:
+    x2 = x.matrix
     size = sub.vector.size
-    if x.matrix.nrows != size:
-        raise SizeMismatchError(f"nrows {x.matrix.nrows} != size {size}")
+    if x2.nrows != size:
+        raise SizeMismatchError(f"nrows {x2.nrows} != size {size}")
     # Convert sub's values into the diagonal of a matrix
     index, vals = sub.vector.to_values()
     diag = grblas.Matrix.from_values(index, index, vals, nrows=size, ncols=size)
     # Multiply the diagonal matrix by the shape of x (any_first will only take values from diag)
     # This performs a broadcast of sub's values to the corresponding locations in x
-    m_broadcast = diag.mxm(x.matrix, grblas.semiring.any_first).new()  # <-- injecting a different semiring here could do the computation for us
+    y2 = diag.mxm(x2, grblas.semiring.any_first).new()
     # mxm is an intersection operation, so mismatched codes are missing in m_broadcast
-    # Check if sub contained more rows than are present in m_broadcast
-    v_x = m_broadcast.reduce_rows(grblas.monoid.any).new()
-    if v_x.nvals < sub.vector.nvals:
-        # Find mismatched codes and add them in with the NULL_KEY
-        v_x(~v_x.S, replace=True)[:] << sub.vector
-        m_broadcast[:, 0] << v_x  # Column 0 is the code for all_dims == NULL_KEY
-    return Pivot(m_broadcast, x.schema, x.left, x.top)
+    if afill is not None:
+        # Check if sub contained more rows than are present in m_broadcast
+        v_x = y2.reduce_rows(grblas.monoid.any).new()
+        if v_x.nvals < sub.vector.nvals:
+            # Find mismatched codes and add them in with the NULL_KEY
+            v_x(~v_x.S, replace=True)[:] << sub.vector
+            # Update y2 with values lost from mxm
+            y2[:, 0] << v_x  # Column 0 is the code for all_dims == NULL_KEY
+            # Fill corresponding elements of x2 if afill
+            if afill is not _fill_like:
+                v_x(v_x.S) << afill
+            x2 = x2.dup()
+            x2[:, 0] << v_x
+    if bfill is _fill_like:
+        y2(~y2.S) << x2
+    elif bfill is not None:
+        ybackup = y2
+        y2 = grblas.Matrix.new(y2.dtype, nrows=y2.nrows, ncols=y2.ncols)
+        y2(x2.S) << bfill
+        y2(ybackup.S) << ybackup
+    # Handle op
+    if op is None:
+        x = Pivot(x2, x.schema, x.left, x.top)
+        y = Pivot(y2, x.schema, x.left, x.top)
+        return (y, x) if reversed else (x, y)
+    else:
+        result = y2.ewise_mult(x2, op=op) if reversed else x2.ewise_mult(y2, op=op)
+        # Save result over x2, but don't modify the original input
+        if afill is None:
+            x2 = result.new()
+        else:
+            x2 << result
+        return Pivot(x2, x.schema, x.left, x.top)
 
 
-def _align_fully_disjoint(x: Flat, y: Flat) -> (Pivot, Pivot):
+def _align_fully_disjoint(x: Flat, y: Flat, op=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:
     xm = grblas.Matrix.new(x.vector.dtype, x.vector.size, 1)
     xm[:, 0] << x.vector
     ym = grblas.Matrix.new(y.vector.dtype, y.vector.size, 1)
     ym[:, 0] << y.vector
     # Perform the cross-joins. Values from only a single input are used per calculation
-    xr = xm.mxm(ym.T, grblas.semiring.any_first).new()
-    yr = xm.mxm(ym.T, grblas.semiring.any_second).new()
-    return (
-        Pivot(xr, x.schema, left=x.dims, top=y.dims),
-        Pivot(yr, x.schema, left=x.dims, top=y.dims)
-    )
+    xr = xm.mxm(ym.T, grblas.semiring.any_first)
+    yr = xm.mxm(ym.T, grblas.semiring.any_second)
+    if op is None:
+        return (
+            Pivot(xr.new(), x.schema, left=x.dims, top=y.dims),
+            Pivot(yr.new(), x.schema, left=x.dims, top=y.dims)
+        )
+    else:
+        result = xr.new()
+        result(accum=op) << yr
+        return Pivot(result, x.schema, left=x.dims, top=y.dims)
 
 
-def _align_partial_disjoint(x: Pivot, y: Pivot) -> (Pivot, Pivot):
+def _align_partial_disjoint(x: Pivot, y: Pivot, op=None, afill=None, bfill=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:
     """
     Assumes left dims are matching dims
     """
@@ -96,14 +175,26 @@ def _align_partial_disjoint(x: Pivot, y: Pivot) -> (Pivot, Pivot):
     x1 = x.matrix.apply(grblas.unary.one).new().reduce_rows().new()
     y1 = y.matrix.apply(grblas.unary.one).new().reduce_rows().new()
     combo = x1.ewise_add(y1, grblas.monoid.times).new()
-    # Mask back into x1 and y1 to contain only what applies to each
-    x1(x1.S) << combo
-    y1(y1.S) << combo
-    x1_size = int(x1.reduce().value)
-    y1_size = int(y1.reduce().value)
-    # Grab indices for iteration
-    x1_idx, _ = x1.to_values()
-    y1_idx, _ = y1.to_values()
+    # Mask back into x1 and y1 to contain only what applies to each (unless filling to match)
+    if op is None:
+        xmask = x1.S if afill is None else None
+        ymask = y1.S if bfill is None else None
+        x1(mask=xmask) << combo
+        y1(mask=ymask) << combo
+        x1_size = int(x1.reduce().value)
+        y1_size = int(y1.reduce().value)
+    else:  # op is provided, will only have a single return object
+        # Trim x1 to final size, then compute result_size
+        if afill is None and bfill is None:  # intersecting values only
+            x1 << x1.ewise_mult(y1, grblas.monoid.times)
+        elif afill is None:  # size same as x
+            x1(x1.S, replace=True) << combo
+        elif bfill is None:  # size same as y
+            x1(y1.S, replace=True) << combo
+        else:
+            x1 = combo
+        result_size = int(x1.reduce().value)
+
     combo_idx, combo_offset = combo.to_values()
 
     # Extract input arrays in hypercsr format
@@ -118,26 +209,52 @@ def _align_partial_disjoint(x: Pivot, y: Pivot) -> (Pivot, Pivot):
     ys_col_indices = ys['col_indices']
     ys_values = ys['values']
 
-    # Build output data structures
-    r1_rows = np.zeros((x1_size,), dtype=np.uint64)
-    r1_cols = np.zeros((x1_size,), dtype=np.uint64)
-    r1_vals = np.zeros((x1_size,), dtype=xs['values'].dtype)
-    r2_rows = np.zeros((y1_size,), dtype=np.uint64)
-    r2_cols = np.zeros((y1_size,), dtype=np.uint64)
-    r2_vals = np.zeros((y1_size,), dtype=ys['values'].dtype)
+    if op is None:
+        # Build output data structures
+        r1_rows = np.zeros((x1_size,), dtype=np.uint64)
+        r1_cols = np.zeros((x1_size,), dtype=np.uint64)
+        r1_vals = np.zeros((x1_size,), dtype=xs['values'].dtype)
+        r2_rows = np.zeros((y1_size,), dtype=np.uint64)
+        r2_cols = np.zeros((y1_size,), dtype=np.uint64)
+        r2_vals = np.zeros((y1_size,), dtype=ys['values'].dtype)
 
-    _align_partial_disjoint_numba(
-        combo_idx,
-        xs_rows, xs_indptr, xs_col_indices, xs_values,
-        ys_rows, ys_indptr, ys_col_indices, ys_values,
-        r1_rows, r1_cols, r1_vals,
-        r2_rows, r2_cols, r2_vals
-    )
+        _align_partial_disjoint_numba(
+            combo_idx,
+            xs_rows, xs_indptr, xs_col_indices, xs_values,
+            ys_rows, ys_indptr, ys_col_indices, ys_values,
+            r1_rows, r1_cols, r1_vals,
+            r2_rows, r2_cols, r2_vals,
+            afill is not None, bfill is not None,
+            afill if afill is not None and afill is not _fill_like else None,
+            bfill if bfill is not None and bfill is not _fill_like else None
+        )
 
-    return (
-        Pivot(grblas.Matrix.from_values(r1_rows, r1_cols, r1_vals), x.schema, matched_dims, mismatched_dims),
-        Pivot(grblas.Matrix.from_values(r2_rows, r2_cols, r2_vals), x.schema, matched_dims, mismatched_dims)
-    )
+        return (
+            Pivot(grblas.Matrix.from_values(r1_rows, r1_cols, r1_vals), x.schema, matched_dims, mismatched_dims),
+            Pivot(grblas.Matrix.from_values(r2_rows, r2_cols, r2_vals), x.schema, matched_dims, mismatched_dims)
+        )
+
+    else:
+        op = jitted_op(op)
+
+        # Build output data structures
+        r_rows = np.zeros((result_size,), dtype=np.uint64)
+        r_cols = np.zeros((result_size,), dtype=np.uint64)
+        r_vals = np.zeros((result_size,), dtype=grblas.dtypes.unify(xs['values'].dtype, ys['values'].dtype))
+
+        _align_partial_disjoint_numba_op(
+            op, combo_idx,
+            xs_rows, xs_indptr, xs_col_indices, xs_values,
+            ys_rows, ys_indptr, ys_col_indices, ys_values,
+            r_rows, r_cols, r_vals,
+            afill is not None, bfill is not None,
+            afill if afill is not None and afill is not _fill_like else None,
+            bfill if bfill is not None and bfill is not _fill_like else None
+        )
+
+        return (
+            Pivot(grblas.Matrix.from_values(r_rows, r_cols, r_vals), x.schema, matched_dims, mismatched_dims)
+        )
 
 
 @numba.njit
@@ -147,6 +264,8 @@ def _align_partial_disjoint_numba(
         ys_rows, ys_indptr, ys_col_indices, ys_values,
         r1_rows, r1_cols, r1_vals,
         r2_rows, r2_cols, r2_vals,
+        fill_x, fill_y,  # boolean
+        x_fillval, y_fillval,  # scalar or None
 ):
     # xi/yi are the current index of xs/ys, not necessarily in sync with combo_idx due to mismatched codes
     xi = 0
@@ -171,8 +290,7 @@ def _align_partial_disjoint_numba(
                     col_idx = xs_col_indices[xj] + ys_col_indices[yj]
                     r1_cols[xoffset] = col_idx
                     r2_cols[yoffset] = col_idx
-                    r1_vals[xoffset] = xs_values[
-                        xj]  # Could do the computation here between r1 and r2 rather than keeping them separate
+                    r1_vals[xoffset] = xs_values[xj]
                     r2_vals[yoffset] = ys_values[yj]
                     xoffset += 1
                     yoffset += 1
@@ -182,11 +300,81 @@ def _align_partial_disjoint_numba(
                 r1_cols[xoffset] = xs_col_indices[xj]
                 r1_vals[xoffset] = xs_values[xj]
                 xoffset += 1
+                if fill_y:
+                    r2_rows[yoffset] = row
+                    r2_cols[yoffset] = xs_col_indices[xj]
+                    if y_fillval is None:
+                        r2_vals[yoffset] = xs_values[xj]
+                    else:
+                        r2_vals[yoffset] = y_fillval
+                    yoffset += 1
         elif yrow >= 0:
             for yj in range(ys_indptr[yrow], ys_indptr[yrow + 1]):
                 r2_rows[yoffset] = row
                 r2_cols[yoffset] = ys_col_indices[yj]
                 r2_vals[yoffset] = ys_values[yj]
                 yoffset += 1
+                if fill_x:
+                    r1_rows[xoffset] = row
+                    r1_cols[xoffset] = ys_col_indices[yj]
+                    if x_fillval is None:
+                        r1_vals[xoffset] = ys_values[yj]
+                    else:
+                        r1_vals[xoffset] = x_fillval
+                    xoffset += 1
+        else:
+            raise Exception("Unhandled row")
+
+
+# @numba.njit
+def _align_partial_disjoint_numba_op(
+        op, combo_idx,
+        xs_rows, xs_indptr, xs_col_indices, xs_values,
+        ys_rows, ys_indptr, ys_col_indices, ys_values,
+        r_rows, r_cols, r_vals,
+        fill_x, fill_y,  # boolean
+        x_fillval, y_fillval,  # scalar or None
+):
+    # xi/yi are the current index of xs/ys, not necessarily in sync with combo_idx due to mismatched codes
+    xi = 0
+    yi = 0
+    offset = 0
+    for row in combo_idx:
+        # Find xrow and yrow, if available
+        xrow, yrow = -1, -1
+        if xi < len(xs_rows) and xs_rows[xi] == row:
+            xrow = xi
+            xi += 1
+        if yi < len(ys_rows) and ys_rows[yi] == row:
+            yrow = yi
+            yi += 1
+        # Iterate over x and y indices for this row
+        if xrow >= 0 and yrow >= 0:
+            for xj in range(xs_indptr[xrow], xs_indptr[xrow + 1]):
+                for yj in range(ys_indptr[yrow], ys_indptr[yrow + 1]):
+                    r_rows[offset] = row
+                    col_idx = xs_col_indices[xj] + ys_col_indices[yj]
+                    r_cols[offset] = col_idx
+                    # Could do the computation here between r1 and r2 rather than keeping them separate
+                    r_vals[offset] = op(xs_values[xj], ys_values[yj])
+                    offset += 1
+        elif xrow >= 0:
+            if not fill_y:
+                continue
+            for xj in range(xs_indptr[xrow], xs_indptr[xrow + 1]):
+                r_rows[offset] = row
+                r_cols[offset] = xs_col_indices[xj]
+                other_val = xs_values[xj] if y_fillval is None else y_fillval
+                r_vals[offset] = op(xs_values[xj], other_val)
+                offset += 1
+        elif yrow >= 0:
+            if not fill_x:
+                continue
+            for yj in range(ys_indptr[yrow], ys_indptr[yrow + 1]):
+                r_rows[offset] = row
+                r_cols[offset] = ys_col_indices[yj]
+                other_val = ys_values[yj] if x_fillval is None else x_fillval
+                r_vals[offset] = op(ys_values[yj], other_val)
+                offset += 1
         else:
             raise Exception("Unhandled row")
