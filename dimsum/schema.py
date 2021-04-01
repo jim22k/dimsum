@@ -1,7 +1,8 @@
 import math
-from typing import Set, Tuple, Optional
+from typing import Set, Tuple, List, Union, Optional, Iterable
 import numpy as np
 import pandas as pd
+from .container import CodedArray
 
 
 NULL_KEY = "∅"  # \u2205
@@ -127,7 +128,7 @@ class Schema:
             values[name] = dim[index]
         return values
 
-    def decode_many(self, array: np.ndarray, names: Optional[Tuple[str]] = None) -> pd.DataFrame:
+    def decode_many(self, array: np.ndarray, names: Optional[Iterable[str]] = None) -> pd.DataFrame:
         if names is None:
             names = self.names
         df = pd.DataFrame()
@@ -147,3 +148,29 @@ class Schema:
 
     def mask_to_dims(self, mask: int) -> Set[str]:
         return {dim for dim in self.mask if mask & self.mask[dim]}
+
+    def encode(self, df_or_series: Union[pd.DataFrame, pd.Series], dims: List[str] = None, value_column: str = None) -> CodedArray:
+        """
+        Converts a DataFrame or Series to a CodedArray.
+
+        If providing a DataFrame, the dimensions and value column are required.
+
+        If providing a Series, it must have a named Index or MultiIndex. The name or level names will be used
+        as the dimension names.
+
+        :param df_or_series: pd.DataFrame or pd.Series
+        :param dims: List[str] list of column headers (only needed for DataFrame)
+        :param value_column: str column header (only needed for DataFrame)
+        :return: CodedArray
+        """
+        inp = df_or_series
+        if isinstance(inp, pd.DataFrame):
+            if dims is None or value_column is None:
+                raise TypeError("`dims` and `value_column` are required when providing a DataFrame")
+            return CodedArray.from_dataframe(inp, self, dims, value_column)
+        elif isinstance(inp, pd.Series):
+            if dims is not None or value_column is not None:
+                raise TypeError("`dims` and `value_column` are not allowed when providing a Series")
+            return CodedArray.from_series(inp, self)
+        else:
+            raise TypeError(f"DataFrame or Series is required, not {type(inp)}")

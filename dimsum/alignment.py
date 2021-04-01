@@ -15,13 +15,13 @@ class SizeMismatchError(Exception):
 _fill_like = object()
 
 
-def align(a: Flat, b: Flat, operator=None, afill=None, bfill=None):
+def align_flats(a: Flat, b: Flat, op=None, afill=None, bfill=None):
     """
     Aligns two Flats, returning two Pivots with matching left and top dimensions.
 
     If a and b are already aligned, returns Flats instead of Pivots.
 
-    If operator is provided, returns a single Pivot. Otherwise returns a 2-tuple of Pivots
+    If op is provided, returns a single Pivot. Otherwise returns a 2-tuple of Pivots
 
     afill and bfill are used to determine the kind of alignment
     afill=None, bfill=None -> inner join
@@ -31,7 +31,7 @@ def align(a: Flat, b: Flat, operator=None, afill=None, bfill=None):
 
     :param a: Flat
     :param b: Flat
-    :param operator: grblas.BinaryOp (default None)
+    :param op: grblas.BinaryOp (default None)
     :param afill: scalar or Flat (default None)
     :param bfill: scalar or Flat (default None)
     :return: Pivot or (Pivot, Pivot)
@@ -47,25 +47,79 @@ def align(a: Flat, b: Flat, operator=None, afill=None, bfill=None):
     # Determine which object is a subset of the other, or if they are fully disjoint
     mismatched_dims = a.dims ^ b.dims
     if not mismatched_dims:
-        result = _already_aligned(a, b, operator, afill, bfill)
+        result = _already_aligned_flats(a, b, op, afill, bfill)
     elif a.dims - b.dims == mismatched_dims:  # b is the subset
         a = a.pivot(top=mismatched_dims)
-        result = _align_subset(a, b, operator, afill, bfill)
+        result = _align_subset(a, b, op, afill, bfill)
     elif b.dims - a.dims == mismatched_dims:  # a is the subset
         b = b.pivot(top=mismatched_dims)
-        result = _align_subset(b, a, operator, bfill, afill, reversed=True)
+        result = _align_subset(b, a, op, bfill, afill, reversed=True)
     else:  # disjoint
         matched_dims = a.dims & b.dims
         if matched_dims:  # partial disjoint
             a = a.pivot(left=matched_dims)
             b = b.pivot(left=matched_dims)
-            result = _align_partial_disjoint(a, b, operator, afill, bfill)
+            result = _align_partial_disjoint(a, b, op, afill, bfill)
         else:  # full disjoint
-            result = _align_fully_disjoint(a, b, operator)
+            result = _align_fully_disjoint(a, b, op)
     return result
 
 
-def _already_aligned(a: Flat, b: Flat, op=None, afill=None, bfill=None) -> Union[Flat, Tuple[Flat, Flat]]:
+def align_pivots(a: Pivot, b: Pivot, op=None, afill=None, bfill=None):
+    """
+    Aligns two Pivots, returning two Pivots with matching left and top dimensions.
+
+    If op is provided, returns a single Pivot. Otherwise returns a 2-tuple of Pivots
+
+    afill and bfill are used to determine the kind of alignment
+    afill=None, bfill=None -> inner join
+    afill!=None, bfill=None -> left join
+    afill=None, bfill!=None -> right join
+    afill!=None, bfill!=None -> outer join
+
+    :param a: Pivot
+    :param b: Pivot
+    :param op: grblas.BinaryOp (default None)
+    :param afill: scalar or Flat (default None)
+    :param bfill: scalar or Flat (default None)
+    :return: Pivot or (Pivot, Pivot)
+    """
+    if a.schema is not b.schema:
+        raise SchemaMismatchError("Objects have different schemas")
+
+    if afill is not None and afill is b:
+        afill = _fill_like
+    if bfill is not None and bfill is a:
+        bfill = _fill_like
+
+    # Determine which object is a subset of the other, or if they are fully disjoint
+    a_dims = a.left | a.top
+    b_dims = b.left | b.top
+    mismatched_dims = a_dims ^ b_dims
+    if not mismatched_dims:
+        result = _already_aligned_pivots(a, b.pivot(left=a.left), op, afill, bfill)
+    elif a_dims - b_dims == mismatched_dims:  # b is the subset
+        a = a.pivot(top=mismatched_dims)
+        result = _align_subset(a, b.flatten(), op, afill, bfill)
+    elif b_dims - a_dims == mismatched_dims:  # a is the subset
+        b = b.pivot(top=mismatched_dims)
+        result = _align_subset(b, a.flatten(), op, bfill, afill, reversed=True)
+    else:  # disjoint
+        matched_dims = a_dims & b_dims
+        if matched_dims:  # partial disjoint
+            a = a.pivot(left=matched_dims)
+            b = b.pivot(left=matched_dims)
+            result = _align_partial_disjoint(a, b, op, afill, bfill)
+        else:  # full disjoint
+            result = _align_fully_disjoint(a.flatten(), b.flatten(), op)
+    return result
+
+
+def _already_aligned_flats(a: Flat, b: Flat, op=None, afill=None, bfill=None) -> Union[Flat, Tuple[Flat, Flat]]:
+    """
+    a.dims must equal b.dims
+    """
+    assert a.dims == b.dims, f"Mismatching dimensions {a.dims ^ b.dims}"
     # Create a2 and b2 as expanded, filled vectors
     a2, b2 = a.vector, b.vector
     if afill is _fill_like:
@@ -97,7 +151,49 @@ def _already_aligned(a: Flat, b: Flat, op=None, afill=None, bfill=None) -> Union
         return Flat(a2, a.schema, a.dims)
 
 
+def _already_aligned_pivots(a: Pivot, b: Pivot, op=None, afill=None, bfill=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:
+    """
+    a.left must equal b.left
+    a.top must equal b.top
+    """
+    assert a.left == b.left, f"Mismatching left dimensions {a.left ^ b.left}"
+    assert a.top == b.top, f"Mismatching top dimensions {a.top ^ b.top}"
+    # Create a2 and b2 as expanded, filled matrices
+    a2, b2 = a.matrix, b.matrix
+    if afill is _fill_like:
+        a2 = a2.dup()
+        a2(~a2.S) << b2
+    elif afill is not None:
+        a2 = grblas.Matrix.new(a2.dtype, nrows=a2.nrows, ncols=a2.ncols)
+        a2(b2.S) << afill
+        a2(a.matrix.S) << a.matrix
+
+    if bfill is _fill_like:
+        b2 = b2.dup()
+        b2(~b2.S) << a2
+    elif bfill is not None:
+        b2 = grblas.Matrix.new(b2.dtype, nrows=b2.nrows, ncols=b2.ncols)
+        b2(a2.S) << bfill
+        b2(b.matrix.S) << b.matrix
+
+    # Handle op
+    if op is None:
+        return Pivot(a2, a.schema, a.left, a.top), Pivot(b2, b.schema, b.left, b.top)
+    else:
+        result = a2.ewise_mult(b2, op=op)
+        # Save result over a2, but don't modify the original input
+        if afill is None:
+            a2 = result.new()
+        else:
+            a2 << result
+        return Pivot(a2, a.schema, a.left, a.top)
+
+
 def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed=False) -> Union[Pivot, Tuple[Pivot, Pivot]]:
+    """
+    x must have mismatched dims on top
+    sub must have dims exactly matching x.left
+    """
     x2 = x.matrix
     size = sub.vector.size
     if x2.nrows != size:
@@ -109,7 +205,7 @@ def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed
     # This performs a broadcast of sub's values to the corresponding locations in x
     y2 = diag.mxm(x2, grblas.semiring.any_first).new()
     # mxm is an intersection operation, so mismatched codes are missing in m_broadcast
-    if afill is not None:
+    if op is None or afill is not None:
         # Check if sub contained more rows than are present in m_broadcast
         v_x = y2.reduce_rows(grblas.monoid.any).new()
         if v_x.nvals < sub.vector.nvals:
@@ -117,11 +213,12 @@ def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed
             v_x(~v_x.S, replace=True)[:] << sub.vector
             # Update y2 with values lost from mxm
             y2[:, 0] << v_x  # Column 0 is the code for all_dims == NULL_KEY
-            # Fill corresponding elements of x2 if afill
-            if afill is not _fill_like:
-                v_x(v_x.S) << afill
-            x2 = x2.dup()
-            x2[:, 0] << v_x
+            if afill is not None:
+                # Fill corresponding elements of x2 if afill
+                if afill is not _fill_like:
+                    v_x(v_x.S) << afill
+                x2 = x2.dup()
+                x2[:, 0] << v_x
     if bfill is _fill_like:
         y2(~y2.S) << x2
     elif bfill is not None:
@@ -145,6 +242,9 @@ def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed
 
 
 def _align_fully_disjoint(x: Flat, y: Flat, op=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:
+    """
+    x.dims must have no overlap with y.dims
+    """
     xm = grblas.Matrix.new(x.vector.dtype, x.vector.size, 1)
     xm[:, 0] << x.vector
     ym = grblas.Matrix.new(y.vector.dtype, y.vector.size, 1)
@@ -165,7 +265,8 @@ def _align_fully_disjoint(x: Flat, y: Flat, op=None) -> Union[Pivot, Tuple[Pivot
 
 def _align_partial_disjoint(x: Pivot, y: Pivot, op=None, afill=None, bfill=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:
     """
-    Assumes left dims are matching dims
+    x.left must match y.left
+    x.top must have no overlap with y.top
     """
     assert x.left == y.left
     matched_dims = x.left
@@ -326,7 +427,7 @@ def _align_partial_disjoint_numba(
             raise Exception("Unhandled row")
 
 
-# @numba.njit
+@numba.njit
 def _align_partial_disjoint_numba_op(
         op, combo_idx,
         xs_rows, xs_indptr, xs_col_indices, xs_values,
