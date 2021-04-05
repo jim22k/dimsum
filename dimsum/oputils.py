@@ -62,3 +62,12 @@ def jitted_op(op):
         _op_jitted[op] = jit_op_wrapper
 
     return _op_jitted[op]
+
+
+_binary_op_lookup = {
+    'add': grblas.binary.plus,
+    'subtract': grblas.binary.minus,
+    'multiply': grblas.binary.times,
+    'true_divide': grblas.binary.truediv,
+    'floor_divide': grblas.binary.floordiv,
+}

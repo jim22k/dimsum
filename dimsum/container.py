@@ -2,7 +2,10 @@ import inspect
 from typing import Set, List, Optional
 import grblas
 import numpy as np
+import numpy.lib.mixins
 import pandas as pd
+from numbers import Number
+from . import oputils
 
 
 def _normalize_dims(dims) -> Set[str]:
@@ -237,7 +240,7 @@ class Pivot:
         return df
 
 
-class CodedArray:
+class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
     def __init__(self, flat_or_pivot):
         if type(flat_or_pivot) not in (Flat, Pivot):
             raise TypeError(f"Flat or Pivot required, not {type(flat_or_pivot)}")
@@ -251,7 +254,7 @@ class CodedArray:
 
     @property
     def X(self):
-        return ExpandingCodedArray(self.obj)
+        return ExpandingCodedArray(self)
 
     @classmethod
     def from_dataframe(cls, df: pd.DataFrame, schema: "Schema", dims: List[str], value_column: str) -> "CodedArray":
@@ -298,10 +301,120 @@ class CodedArray:
         """
         return self.obj.to_dataframe()
 
+    def flatten(self) -> "CodedArray":
+        if type(self.obj) is Flat:
+            return self
+        return self.obj.flatten()
 
-class ExpandingCodedArray:
-    def __init__(self, coded_array, *, fill_value=None):
-        self.obj = coded_array
+    def pivot(self, left: Optional[Set[str]] = None, top: Optional[Set[str]] = None) -> "CodedArray":
+        return CodedArray(self.obj.pivot(left=left, top=top))
+
+    def apply(self, op, *, left=None, right=None, inplace=False):
+        if type(self.obj) is Flat:
+            vec = self.obj.vector.apply(op, left=left, right=right)
+            if inplace:
+                self.obj.vector << vec
+                vec = self.obj.vector
+            else:
+                vec = vec.new()
+            result = Flat(vec, self.obj.schema, self.obj.dims)
+        else:
+            mat = self.obj.matrix.apply(op, left=left, right=right)
+            if inplace:
+                self.obj.matrix << mat
+                mat = self.obj.matrix
+            else:
+                mat = mat.new()
+            result = Pivot(mat, self.obj.schema, self.obj.left, self.obj.top)
+        return CodedArray(result)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        return CodedArray._ufunc_handler(ufunc, method, *inputs, **kwargs)
+
+    @staticmethod
+    def _ufunc_handler(ufunc, method, *inputs, **kwargs):
+        func_name = ufunc.__name__
+        if func_name in oputils._binary_op_lookup:
+            gbfunc = oputils._binary_op_lookup[func_name]
+        else:
+            try:
+                gbfunc = getattr(grblas.op.numpy, func_name)
+            except AttributeError:
+                raise NotImplemented
+        if method == '__call__':
+            nscalar = 0
+            narray = 0
+            args = []
+            fills = []
+            for input in inputs:
+                if isinstance(input, Number):
+                    nscalar += 1
+                    args.append(input)
+                    fills.append(None)
+                elif type(input) is CodedArray:
+                    narray += 1
+                    args.append(input)
+                    fills.append(None)
+                elif type(input) is ExpandingCodedArray:
+                    narray += 1
+                    args.append(input.coded_array)
+                    fills.append(input.fill_value)
+                else:
+                    return NotImplemented
+            if kwargs:
+                raise NotImplementedError(f'These arguments are not handled currently: {kwargs.keys()}')
+
+            if nscalar + narray != ufunc.nin:
+                raise TypeError(f"{func_name} expects {ufunc.nin} inputs, received {nscalar + narray}")
+            if ufunc.nin == 1:
+                # ex. np.sin(a) or np.sin(a.X)
+                assert nscalar == 0, f"unexpected input to {func_name}"
+                assert narray == 1, f"unexpected input to {func_name}"
+                ret = args[0].apply(gbfunc)
+                if fills[0] is not None:
+                    return ExpandingCodedArray(ret, fill_value=fills[0])
+                return ret
+            elif nscalar > 0:
+                # ex. a + 3 or 2 * a.X
+                assert nscalar == 1, f"unexpected input to {func_name}"
+                assert narray == 1, f"unexpected input to {func_name}"
+                if isinstance(args[0], Number):
+                    ret = args[1].apply(gbfunc, left=args[0])
+                    fill = fills[1]
+                else:
+                    ret = args[0].apply(gbfunc, right=args[1])
+                    fill = fills[0]
+                if fill is not None:
+                    return ExpandingCodedArray(ret, fill_value=fill)
+                return ret
+            else:
+                # ex. a + b or np.arctan2(a, b.X)
+                assert narray == 2, f"unexpected input to {func_name}"
+                from . import alignment
+
+                arrays = [arg.obj for arg in args]
+                all_pivots = all(type(arr) is Pivot for arr in arrays)
+                if all_pivots:
+                    result = alignment.align_pivots(*arrays, gbfunc, *fills)
+                else:
+                    arrays = [arr if type(arr) is Flat else arr.flatten() for arr in arrays]
+                    result = alignment.align_flats(*arrays, gbfunc, *fills)
+                return CodedArray(result)
+        elif method == 'reduce':
+            # TODO: support reduce for pivoted input
+            raise NotImplemented
+        elif method == 'accumulate':
+            # TODO: possibly support accumulate for pivoted input
+            raise NotImplemented
+        else:
+            return NotImplemented
+
+
+class ExpandingCodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
+    def __init__(self, coded_array, fill_value=0):
+        self.coded_array = coded_array
+        if not isinstance(fill_value, Number):
+            raise TypeError(f"fill_value must be a scalar number, not {type(fill_value)}")
         self.fill_value = fill_value
 
     def __getitem__(self, fill_value):
@@ -310,20 +423,23 @@ class ExpandingCodedArray:
 
             # An ExpandingCodedArray expanding like another CodedArray has all the information
             # needed to fully realize itself back into a CodedArray
-            obj_type = type(self.obj)
+            obj_type = type(self.coded_array.obj)
             fill_type = type(fill_value.obj)
             if obj_type is Pivot and fill_type is Pivot:
-                ret, _ = alignment.align_pivots(self.obj, fill_value.obj, afill=fill_value.obj)
+                ret, _ = alignment.align_pivots(self.coded_array.obj, fill_value.obj, afill=fill_value.obj)
             elif obj_type is Flat and fill_type is Flat:
-                ret, _ = alignment.align_flats(self.obj, fill_value.obj, afill=fill_value.obj)
+                ret, _ = alignment.align_flats(self.coded_array.obj, fill_value.obj, afill=fill_value.obj)
             elif obj_type is Pivot:
-                ret, _ = alignment.align_flats(self.obj.flatten(), fill_value.obj, afill=fill_value.obj)
+                ret, _ = alignment.align_flats(self.coded_array.obj.flatten(), fill_value.obj, afill=fill_value.obj)
             else:
                 flat_fill = fill_value.obj.flatten()
-                ret, _ = alignment.align_flats(self.obj, flat_fill, afill=flat_fill)
+                ret, _ = alignment.align_flats(self.coded_array.obj, flat_fill, afill=flat_fill)
             return CodedArray(ret)
         elif isinstance(fill_value, (int, float, bool)):
             # Return a new ExpandingCodedArray, this time with the fill value included
-            return ExpandingCodedArray(self.obj, fill_value=fill_value)
+            return ExpandingCodedArray(self.coded_array, fill_value=fill_value)
         else:
             raise TypeError(f"Illegal type for fill value: {type(fill_value)}")
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        return CodedArray._ufunc_handler(ufunc, method, *inputs, **kwargs)
