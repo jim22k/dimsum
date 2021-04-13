@@ -25,6 +25,9 @@ def _compute_missing_dims(dims: Set[str], subset: Set[str]) -> Set[str]:
     return dims - subset
 
 
+_reduce_op_default = inspect.signature(grblas.Matrix.reduce_rows).parameters['op'].default
+
+
 class Flat:
     """
     Coded data in a flat structure, represented by a GraphBLAS Vector
@@ -46,11 +49,20 @@ class Flat:
         return self.vector.nvals
 
     @property
+    def data(self):
+        return self.vector
+
+    @property
     def dims_list(self):
         """
         Returns the dimensions as a list, ordered according to the schema
         """
         return [n for n in self.schema.names if n in self.dims]
+
+    def copy(self, dtype=None):
+        if dtype is not None:
+            dtype = grblas.dtypes.lookup_dtype(dtype)
+        return Flat(self.vector.dup(dtype=dtype), self.schema, self.dims)
 
     def pivot(self, *, left: Optional[Set[str]] = None, top: Optional[Set[str]] = None) -> "Pivot":
         # Check dimensions
@@ -82,6 +94,9 @@ class Flat:
         cols = index & top_mask
         matrix = grblas.Matrix.from_values(rows, cols, vals, nrows=left_mask + 1, ncols=top_mask + 1)
         return Pivot(matrix, self.schema, left, top)
+
+    def reduce(self, op=_reduce_op_default):
+        return self.vector.reduce(op).value
 
     @classmethod
     def from_dataframe(cls, df: pd.DataFrame, schema: "Schema", dims: List[str], value_column: str) -> "Flat":
@@ -169,6 +184,15 @@ class Pivot:
             df = self.to_dataframe()
             return df._repr_html_()
 
+    @property
+    def data(self):
+        return self.matrix
+
+    def copy(self, dtype=None):
+        if dtype is not None:
+            dtype = grblas.dtypes.lookup_dtype(dtype)
+        return Pivot(self.matrix.dup(dtype=dtype), self.schema, self.left, self.top)
+
     def flatten(self) -> Flat:
         rows, cols, vals = self.matrix.to_values()
         index = rows | cols
@@ -214,17 +238,16 @@ class Pivot:
         matrix = grblas.Matrix.from_values(rows, cols, vals, nrows=left_mask + 1, ncols=top_mask + 1)
         return Pivot(matrix, self.schema, left, top)
 
-    op_default = inspect.signature(grblas.Matrix.reduce_rows).parameters['op'].default
-    def reduce_rows(self, op=op_default):
+    def reduce_rows(self, op=_reduce_op_default):
         vector = self.matrix.reduce_rows(op).new()
         return Flat(vector, self.schema, self.left)
 
-    op_default = inspect.signature(grblas.Matrix.reduce_columns).parameters['op'].default
-    def reduce_columns(self, op=op_default):
+    def reduce_columns(self, op=_reduce_op_default):
         vector = self.matrix.reduce_columns(op).new()
         return Flat(vector, self.schema, self.top)
 
-    del op_default
+    def reduce(self, op=_reduce_op_default):
+        return self.matrix.reduce_scalar(op).value
 
     def to_dataframe(self):
         left_dims = [n for n in self.schema.names if n in self.left]
@@ -251,6 +274,40 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
     def _repr_html_(self):
         return self.obj._repr_html_()
+
+    @property
+    def dims(self):
+        if type(self.obj) is Flat:
+            return self.obj.dims
+        return self.obj.left | self.obj.top
+
+    @property
+    def left(self):
+        if type(self.obj) is Flat:
+            raise TypeError("Unpivoted CodedArray does not have left dimensions")
+        return self.obj.left
+
+    @property
+    def top(self):
+        if type(self.obj) is Flat:
+            raise TypeError("Unpivoted CodedArray does not have top dimensions")
+        return self.obj.top
+
+    @property
+    def shape(self):
+        if type(self.obj) is Flat:
+            return (len(self.obj.dims),)
+        return len(self.obj.left), len(self.obj.top)
+
+    @property
+    def is_pivoted(self):
+        return type(self.obj) is Pivot
+
+    @property
+    def dtype(self):
+        if type(self.obj) is Flat:
+            return self.obj.vector.dtype
+        return self.obj.matrix.dtype
 
     @property
     def X(self):
@@ -328,6 +385,46 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             result = Pivot(mat, self.obj.schema, self.obj.left, self.obj.top)
         return CodedArray(result)
 
+    def filter(self, cond, *, _afill=None):
+        """
+        Return a new CodedArray containing only those elements where `cond` is True.
+        """
+        from . import alignment
+
+        bfill = None
+        if type(cond) is ExpandingCodedArray:
+            bfill = cond.fill_value
+            cond = cond.coded_array
+
+        if cond.dtype != 'BOOL':
+            raise TypeError(f'filter condition must been boolean, not {cond.obj.dtype}')
+        if cond.dims - self.dims:
+            raise TypeError(f'Dimensions of filter condition must be a subset. Invalid dims: {cond.dims - self.dims}')
+
+        x, y = alignment.align(self.obj, cond.obj, afill=_afill, bfill=bfill)
+        if type(x) is Flat:
+            vec = grblas.Vector.new(x.vector.dtype, x.vector.size)
+            vec(mask=y.vector.V) << x.vector
+            result = Flat(vec, x.schema, x.dims)
+        else:
+            mat = grblas.Matrix.new(x.matrix.dtype, x.matrix.nrows, x.matrix.ncols)
+            mat(mask=y.matrix.V) << x.matrix
+            result = Pivot(mat, x.schema, x.left, x.top)
+        return CodedArray(result)
+
+    def reduce_rows(self, op=_reduce_op_default):
+        if type(self.obj) is not Pivot:
+            raise TypeError("reduce_rows can only be used for pivoted CodedArrays")
+        return CodedArray(self.obj.reduce_rows(op))
+
+    def reduce_columns(self, op=_reduce_op_default):
+        if type(self.obj) is not Pivot:
+            raise TypeError("reduce_columns can only be used for pivoted CodedArrays")
+        return CodedArray(self.obj.reduce_columns(op))
+
+    def reduce(self, op=_reduce_op_default):
+        return self.obj.reduce(op)
+
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         return CodedArray._ufunc_handler(ufunc, method, *inputs, **kwargs)
 
@@ -393,12 +490,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
                 from . import alignment
 
                 arrays = [arg.obj for arg in args]
-                all_pivots = all(type(arr) is Pivot for arr in arrays)
-                if all_pivots:
-                    result = alignment.align_pivots(*arrays, gbfunc, *fills)
-                else:
-                    arrays = [arr if type(arr) is Flat else arr.flatten() for arr in arrays]
-                    result = alignment.align_flats(*arrays, gbfunc, *fills)
+                result = alignment.align(*arrays, gbfunc, *fills)
                 return CodedArray(result)
         elif method == 'reduce':
             # TODO: support reduce for pivoted input
@@ -423,17 +515,7 @@ class ExpandingCodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
             # An ExpandingCodedArray expanding like another CodedArray has all the information
             # needed to fully realize itself back into a CodedArray
-            obj_type = type(self.coded_array.obj)
-            fill_type = type(fill_value.obj)
-            if obj_type is Pivot and fill_type is Pivot:
-                ret, _ = alignment.align_pivots(self.coded_array.obj, fill_value.obj, afill=fill_value.obj)
-            elif obj_type is Flat and fill_type is Flat:
-                ret, _ = alignment.align_flats(self.coded_array.obj, fill_value.obj, afill=fill_value.obj)
-            elif obj_type is Pivot:
-                ret, _ = alignment.align_flats(self.coded_array.obj.flatten(), fill_value.obj, afill=fill_value.obj)
-            else:
-                flat_fill = fill_value.obj.flatten()
-                ret, _ = alignment.align_flats(self.coded_array.obj, flat_fill, afill=flat_fill)
+            ret, _ = alignment.align(self.coded_array.obj, fill_value.obj, afill=fill_value.obj)
             return CodedArray(ret)
         elif isinstance(fill_value, (int, float, bool)):
             # Return a new ExpandingCodedArray, this time with the fill value included
@@ -443,3 +525,6 @@ class ExpandingCodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         return CodedArray._ufunc_handler(ufunc, method, *inputs, **kwargs)
+
+    def filter(self, cond):
+        return self.coded_array.filter(cond, _afill=self.fill_value)

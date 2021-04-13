@@ -52,8 +52,13 @@ _op_jitted = {}
 
 
 def jitted_op(op):
-    if not isinstance(op, np.ufunc) and op in _grblas_op_lookup:
-        op = _grblas_op_lookup[op]
+    if not isinstance(op, np.ufunc):
+        if op in _grblas_op_lookup:
+            op = _grblas_op_lookup[op]
+        elif hasattr(op, 'name') and op.name.startswith('numpy.'):
+            op = getattr(np, op.name[6:])
+        else:
+            raise TypeError(f'Cannot jit compile op: {op}')
 
     if op not in _op_jitted:
         @numba.njit

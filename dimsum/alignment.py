@@ -15,6 +15,31 @@ class SizeMismatchError(Exception):
 _fill_like = object()
 
 
+def align(a: Union[Flat, Pivot], b: Union[Flat, Pivot], op=None, afill=None, bfill=None):
+    """
+    Dispatched to align_pivots if both a and b and Pivots.
+    Otherwise dispatches to align_flats, converting any Pivots to Flats using .flatten()
+    """
+    if a.schema is not b.schema:
+        raise SchemaMismatchError("Objects have different schemas")
+
+    if afill is not None and afill is b:
+        afill = _fill_like
+    if bfill is not None and bfill is a:
+        bfill = _fill_like
+
+    a_type = type(a)
+    b_type = type(b)
+    if a_type is Pivot and b_type is Pivot:
+        return align_pivots(a, b, op=op, afill=afill, bfill=bfill)
+    elif a_type is Flat and b_type is Flat:
+        return align_flats(a, b, op=op, afill=afill, bfill=bfill)
+    elif a_type is Pivot:
+        return align_flats(a.flatten(), b, op=op, afill=afill, bfill=bfill)
+    else:
+        return align_flats(a, b.flatten(), op=op, afill=afill, bfill=bfill)
+
+
 def align_flats(a: Flat, b: Flat, op=None, afill=None, bfill=None):
     """
     Aligns two Flats, returning two Pivots with matching left and top dimensions.
@@ -218,7 +243,7 @@ def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed
                 if afill is not _fill_like:
                     v_x(v_x.S) << afill
                 x2 = x2.dup()
-                x2[:, 0] << v_x
+                x2(v_x.S)[:, 0] << v_x
     if bfill is _fill_like:
         y2(~y2.S) << x2
     elif bfill is not None:
@@ -271,10 +296,11 @@ def _align_partial_disjoint(x: Pivot, y: Pivot, op=None, afill=None, bfill=None)
     assert x.left == y.left
     matched_dims = x.left
     mismatched_dims = x.top | y.top
+    top_mask = x.schema.dims_to_mask(mismatched_dims)
 
     # Compute the size and offsets of the cross join computation
-    x1 = x.matrix.apply(grblas.unary.one).new().reduce_rows().new()
-    y1 = y.matrix.apply(grblas.unary.one).new().reduce_rows().new()
+    x1 = x.matrix.apply(grblas.unary.one).new().reduce_rows(grblas.monoid.plus['INT64']).new()
+    y1 = y.matrix.apply(grblas.unary.one).new().reduce_rows(grblas.monoid.plus['INT64']).new()
     combo = x1.ewise_add(y1, grblas.monoid.times).new()
     # Mask back into x1 and y1 to contain only what applies to each (unless filling to match)
     if op is None:
@@ -331,17 +357,25 @@ def _align_partial_disjoint(x: Pivot, y: Pivot, op=None, afill=None, bfill=None)
         )
 
         return (
-            Pivot(grblas.Matrix.from_values(r1_rows, r1_cols, r1_vals), x.schema, matched_dims, mismatched_dims),
-            Pivot(grblas.Matrix.from_values(r2_rows, r2_cols, r2_vals), x.schema, matched_dims, mismatched_dims)
+            Pivot(grblas.Matrix.from_values(r1_rows, r1_cols, r1_vals, nrows=x.matrix.nrows, ncols=top_mask + 1),
+                  x.schema, matched_dims, mismatched_dims),
+            Pivot(grblas.Matrix.from_values(r2_rows, r2_cols, r2_vals, nrows=x.matrix.nrows, ncols=top_mask + 1),
+                  x.schema, matched_dims, mismatched_dims)
         )
 
     else:
+        unified_input_dtype = grblas.dtypes.unify(
+            grblas.dtypes.lookup_dtype(xs['values'].dtype),
+            grblas.dtypes.lookup_dtype(ys['values'].dtype)
+        )
+        output_dtype_str = op.types[grblas.dtypes.lookup_dtype(unified_input_dtype).name]
+
         op = jitted_op(op)
 
         # Build output data structures
         r_rows = np.zeros((result_size,), dtype=np.uint64)
         r_cols = np.zeros((result_size,), dtype=np.uint64)
-        r_vals = np.zeros((result_size,), dtype=grblas.dtypes.unify(xs['values'].dtype, ys['values'].dtype))
+        r_vals = np.zeros((result_size,), dtype=grblas.dtypes.lookup_dtype(output_dtype_str).np_type)
 
         _align_partial_disjoint_numba_op(
             op, combo_idx,
