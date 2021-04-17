@@ -5,7 +5,7 @@ import pandas as pd
 from .container import CodedArray
 
 
-NULL_KEY = "∅"  # \u2205
+NULL = "∅"  # \u2205
 
 
 class SchemaMismatchError(Exception):
@@ -29,12 +29,12 @@ class Dimension:
         if None in lookup:
             raise ValueError("`None` is not an allowable value")
 
-        if NULL_KEY in lookup:
-            raise ValueError("NULL_KEY (∅) is not an allowable value")
+        if NULL in lookup:
+            raise ValueError("NULL (∅) is not an allowable value")
 
         # Add in NULL key (Python `None`), always at the zero bit value
-        values = (NULL_KEY,) + values
-        lookup[NULL_KEY] = 0
+        values = (NULL,) + values
+        lookup[NULL] = 0
 
         self.values = values
         self.lookup = lookup
@@ -99,6 +99,8 @@ class Schema:
         code = 0
         for name, val in values.items():
             dim = self._lookup[name]
+            if val is None:
+                val = NULL
             index = dim.lookup[val]
             offset = self._offset[name]
             code |= index << offset
@@ -111,7 +113,12 @@ class Schema:
         codes = np.zeros(len(values), dtype=np.uint64)
         for name in values.columns:
             vals = values[name]
-            index = self._lookup[name].val2pos[vals].values
+            try:
+                index = self._lookup[name].val2pos[vals].values
+            except ValueError:
+                # Most likely a None is present; convert to NULL
+                vals = vals.where(pd.notna(vals), NULL)
+                index = self._lookup[name].val2pos[vals].values
             offset = self._offset[name]
             codes |= index << offset
         return codes
@@ -149,28 +156,47 @@ class Schema:
     def mask_to_dims(self, mask: int) -> Set[str]:
         return {dim for dim in self.mask if mask & self.mask[dim]}
 
-    def encode(self, df_or_series: Union[pd.DataFrame, pd.Series], dims: List[str] = None, value_column: str = None) -> CodedArray:
+    def encode(self, data, dims: List[str] = None, value_column: str = None) -> CodedArray:
         """
-        Converts a DataFrame or Series to a CodedArray.
+        Converts `data` to a CodedArray. `data` may be one of:
+        - pd.DataFrame
+        - pd.Series
+        - dict
+        - list of lists
 
-        If providing a DataFrame, the dimensions and value column are required.
+        For a DataFrame, dims must be specified. If more than one column remains after dims
+        are accounted for, value_column must be provided. If only a single dimension is required,
+        dims may be a str.
 
-        If providing a Series, it must have a named Index or MultiIndex. The name or level names will be used
-        as the dimension names.
+        For a Series, it must have a named Index or MultiIndex. The name or level names will be used
+        as the dimension names. Providing dims or value_column is not allowed.
 
-        :param df_or_series: pd.DataFrame or pd.Series
-        :param dims: List[str] list of column headers (only needed for DataFrame)
-        :param value_column: str column header (only needed for DataFrame)
+        For a dict, the keys must match the shape of dims. For example, if dims = ['Size', 'Shape']
+        then the dict keys should look like {('Small', 'Circle'): 12.7, ...}. If only a single dimension
+        is required, dims may be a str and dict keys must also be a str.
+
+        For a list of lists, len(dims) must be one less than the length of each row. For example,
+        if dims = ['Size', 'Color'], then the data should look like [['Small', 'Red', 54.8], ...].
+        The value must come at the end of the row. If the row length is exactly 2, dims may be a str.
+
+        :param data: pd.DataFrame or pd.Series or dict or list of lists
+        :param dims: List[str] or str, dimensions
+        :param value_column: str column header (only used for pd.DataFrame)
         :return: CodedArray
         """
-        inp = df_or_series
-        if isinstance(inp, pd.DataFrame):
-            if dims is None or value_column is None:
-                raise TypeError("`dims` and `value_column` are required when providing a DataFrame")
-            return CodedArray.from_dataframe(inp, self, dims, value_column)
-        elif isinstance(inp, pd.Series):
+        if isinstance(data, pd.Series):
             if dims is not None or value_column is not None:
                 raise TypeError("`dims` and `value_column` are not allowed when providing a Series")
-            return CodedArray.from_series(inp, self)
+            return CodedArray.from_series(data, self)
+        elif isinstance(data, pd.DataFrame):
+            return CodedArray.from_dataframe(data, self, dims, value_column)
+        elif isinstance(data, dict):
+            if value_column is not None:
+                raise TypeError("`value_column` is not allowed when providing a dict")
+            return CodedArray.from_dict(data, self, dims)
+        elif isinstance(data, (list, tuple)):
+            if value_column is not None:
+                raise TypeError("`value_column` is not allowed when providing a list of lists")
+            return CodedArray.from_lists(data, self, dims)
         else:
-            raise TypeError(f"DataFrame or Series is required, not {type(inp)}")
+            raise TypeError(f"Unexpected type for data: {type(data)}")

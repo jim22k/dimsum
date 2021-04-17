@@ -234,10 +234,10 @@ def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed
         # Check if sub contained more rows than are present in m_broadcast
         v_x = y2.reduce_rows(grblas.monoid.any).new()
         if v_x.nvals < sub.vector.nvals:
-            # Find mismatched codes and add them in with the NULL_KEY
+            # Find mismatched codes and add them in with the NULL
             v_x(~v_x.S, replace=True)[:] << sub.vector
             # Update y2 with values lost from mxm
-            y2[:, 0] << v_x  # Column 0 is the code for all_dims == NULL_KEY
+            y2[:, 0] << v_x  # Column 0 is the code for all_dims == NULL
             if afill is not None:
                 # Fill corresponding elements of x2 if afill
                 if afill is not _fill_like:

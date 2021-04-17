@@ -1,5 +1,5 @@
 import inspect
-from typing import Set, List, Optional
+from typing import Set, List, Iterable, Optional
 import grblas
 import numpy as np
 import numpy.lib.mixins
@@ -32,7 +32,7 @@ class Flat:
     """
     Coded data in a flat structure, represented by a GraphBLAS Vector
     """
-    def __init__(self, vector, schema: "Schema", dims: Set[str]):
+    def __init__(self, vector, schema: "Schema", dims: Iterable[str]):
         self.vector = vector
         self.schema = schema
         self.dims = set(dims)
@@ -99,17 +99,27 @@ class Flat:
         return self.vector.reduce(op).value
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame, schema: "Schema", dims: List[str], value_column: str) -> "Flat":
+    def from_dataframe(cls, df: pd.DataFrame, schema: "Schema", dims: List[str], value_column: str = None) -> "Flat":
         """
         Converts a DataFrame to a Flat by indicating the dimensions and value column
+
+        value_column is optional if len(df.columns) == len(dims) + 1, meaning only one column is left after
+        accounting for the dimension columns.
 
         :param df: pd.DataFrame
         :param schema: Schema
         :param dims: List[str] list of column headers
-        :param value_column: str column header
+        :param value_column: str column header (optional)
         :return: Flat
         """
         index = schema.encode_many(df[dims])
+        if value_column is None:
+            remaining_cols = df.columns.difference(dims)
+            if len(remaining_cols) > 1:
+                raise TypeError("multiple non-dimension columns exist, must provide value_column")
+            elif len(remaining_cols) == 0:
+                raise TypeError("no value column found")
+            value_column = remaining_cols[0]
         vals = df[value_column].values
         dim_mask = schema.dims_to_mask(dims)
         vec = grblas.Vector.from_values(index, vals, size=dim_mask + 1)
@@ -137,6 +147,26 @@ class Flat:
                 raise TypeError(err_msg)
             dims = [s.index.name]
         df = s.to_frame("* value *").reset_index()
+        return cls.from_dataframe(df, schema, dims, "* value *")
+
+    @classmethod
+    def from_dict(cls, d: dict, schema: "Schema", dims: List[str]) -> "Flat":
+        lst = []
+        if isinstance(dims, str):
+            for k, v in d.items():
+                lst.append([k, v])
+        else:
+            for k, v in d.items():
+                lst.append([*k, v])
+        return cls.from_lists(lst, schema, dims)
+
+    @classmethod
+    def from_lists(cls, lst: List, schema: "Schema", dims: List[str]) -> "Flat":
+        if isinstance(dims, str):
+            dims = [dims]
+        elif not isinstance(dims, list):
+            dims = list(dims)
+        df = pd.DataFrame(lst, columns=dims + ["* value *"])
         return cls.from_dataframe(df, schema, dims, "* value *")
 
     def to_series(self) -> pd.Series:
@@ -314,19 +344,6 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         return ExpandingCodedArray(self)
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame, schema: "Schema", dims: List[str], value_column: str) -> "CodedArray":
-        """
-        Converts a DataFrame to a CodedArray by indicating the dimensions and value column
-
-        :param df: pd.DataFrame
-        :param schema: Schema
-        :param dims: List[str] list of column headers
-        :param value_column: str column header
-        :return: CodedArray
-        """
-        return CodedArray(Flat.from_dataframe(df, schema, dims, value_column))
-
-    @classmethod
     def from_series(cls, s: pd.Series, schema: "Schema") -> "CodedArray":
         """
         Converts a Series to a CodedArray.
@@ -339,6 +356,27 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         :return: CodedArray
         """
         return CodedArray(Flat.from_series(s, schema))
+
+    @classmethod
+    def from_dataframe(cls, df: pd.DataFrame, schema: "Schema", dims: List[str], value_column: str = None) -> "CodedArray":
+        """
+        Converts a DataFrame to a CodedArray by indicating the dimensions and value column
+
+        :param df: pd.DataFrame
+        :param schema: Schema
+        :param dims: List[str] list of column headers
+        :param value_column: str column header
+        :return: CodedArray
+        """
+        return CodedArray(Flat.from_dataframe(df, schema, dims, value_column))
+
+    @classmethod
+    def from_dict(cls, d: dict, schema: "Schema", dims: List[str]) -> "CodedArray":
+        return CodedArray(Flat.from_dict(d, schema, dims))
+
+    @classmethod
+    def from_lists(cls, lst: List, schema: "Schema", dims: List[str]) -> "CodedArray":
+        return CodedArray(Flat.from_lists(lst, schema, dims))
 
     def to_series(self) -> pd.Series:
         """
