@@ -5,6 +5,7 @@ import numpy as np
 import numpy.lib.mixins
 import pandas as pd
 from numbers import Number
+from itertools import product
 from . import oputils
 
 
@@ -339,6 +340,17 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             return self.obj.vector.dtype
         return self.obj.matrix.dtype
 
+    def astype(self, dtype):
+        new_dtype = grblas.dtypes.lookup_dtype(dtype)
+        if new_dtype == self.dtype:
+            return self
+
+        if type(self.obj) is Flat:
+            obj = Flat(self.obj.vector.dup(dtype=new_dtype), self.obj.schema, self.obj.dims)
+        else:
+            obj = Pivot(self.obj.matrix.dup(dtype=new_dtype), self.obj.schema, self.obj.left, self.obj.top)
+        return CodedArray(obj)
+
     @property
     def X(self):
         return ExpandingCodedArray(self)
@@ -399,10 +411,62 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
     def flatten(self) -> "CodedArray":
         if type(self.obj) is Flat:
             return self
-        return self.obj.flatten()
+        return CodedArray(self.obj.flatten())
 
     def pivot(self, left: Optional[Set[str]] = None, top: Optional[Set[str]] = None) -> "CodedArray":
         return CodedArray(self.obj.pivot(left=left, top=top))
+
+    def get_code(self, *dims):
+        """
+        Returns the numeric code for every element, masked by dims
+        If no dims are provided, the full code is returned
+        """
+        obj = self.flatten().obj
+        if not dims:
+            dims = obj.dims
+        index, _ = obj.vector.to_values()
+        mask = obj.schema.dims_to_mask(dims)
+        codes = index & mask
+        vec = grblas.Vector.from_values(index, codes, dtype='INT64', size=obj.vector.size)
+        return CodedArray(Flat(vec, obj.schema, obj.dims))
+
+    def has_code(self, **kwargs):
+        """
+        Returns a boolean CodedArray indicating whether each element matches this code.
+
+        If multiple dimensions are included, the set logic is AND.
+        If multiple values are included for a single dimension, the set logic is OR.
+
+        For example,
+          `x.has_code(size='small', shape=('circle', 'triangle'))`
+        will return
+          True for small circles and small triangles
+          False for everything else
+        """
+        obj = self.flatten().obj
+        schema = obj.schema
+        dims = list(kwargs.keys())
+        mask = schema.dims_to_mask(dims)
+        index, _ = obj.vector.to_values()
+        codes = index & mask
+        # Normalize input values
+        normalized = []
+        for dim_name in dims:
+            dim = schema[dim_name]
+            offset = schema.offset[dim_name]
+            vals = kwargs[dim_name]
+            if not isinstance(vals, (list, tuple, set)):
+                vals = (vals,)
+            vals = [dim.lookup[val] << offset for val in vals]
+            normalized.append(vals)
+        # Test combo pairs
+        matches = np.zeros_like(codes, dtype=bool)
+        for combo in product(*normalized):
+            # Sum up the combo because individual dimension codes have already been bit shifted
+            match_code = sum(combo)
+            matches |= codes == match_code
+        vec = grblas.Vector.from_values(index, matches, dtype=bool, size=obj.vector.size)
+        return CodedArray(Flat(vec, obj.schema, obj.dims))
 
     def apply(self, op, *, left=None, right=None, inplace=False):
         if type(self.obj) is Flat:

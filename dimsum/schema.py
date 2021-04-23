@@ -2,7 +2,8 @@ import math
 from typing import Set, Tuple, List, Union, Optional, Iterable
 import numpy as np
 import pandas as pd
-from .container import CodedArray
+import grblas
+from .container import CodedArray, Flat
 
 
 NULL = "∅"  # \u2205
@@ -53,6 +54,18 @@ class Dimension:
     def __getitem__(self, index):
         return self.values[index]
 
+    def encode(self, data):
+        """
+        Converts codes into indices
+
+        :param data: pd.Series or iterable
+        :return: pd.Series or list
+        """
+        if isinstance(data, pd.Series):
+            return self.val2pos[data]
+        else:
+            return [self.lookup[x] for x in data]
+
 
 class Schema:
     def __init__(self, dimensions):
@@ -63,14 +76,14 @@ class Schema:
         if len(self._lookup) < len(self._dimensions):
             raise ValueError("duplicate dimension names")
 
-        self._offset = {}
+        self.offset = {}
         self.mask = {}
 
         # Populate offsets and masks
         # Use reverse order to make sorting follow first indicated dimension
         bit_pos = 0
         for dim in reversed(self._dimensions):
-            self._offset[dim.name] = bit_pos
+            self.offset[dim.name] = bit_pos
             self.mask[dim.name] = (2**dim.num_bits - 1) << bit_pos
             bit_pos += dim.num_bits
 
@@ -95,6 +108,31 @@ class Schema:
             r.append(f"  {self.mask[dim.name]:0{self.total_bits}b} {dim.name}")
         return '\n'.join(r)
 
+    def dimension_indices(self, dim, masked=False):
+        """
+        Returns a new CodedArray containing all values of `dim` and the associated enumerations for each code
+
+        >>> size = Dimension('size', ['small', 'medium', 'large'])
+        >>> schema = Schema(['size', ...])
+        >>> schema.dimension_indices('size')
+            size  * values *
+        0      ∅           0
+        1  small           1
+        2 medium           2
+        3  large           3
+        """
+        if not isinstance(dim, Dimension):
+            dim = self[dim]
+        offset = self.offset[dim.name]
+        indices = dim.val2pos.values
+        codes = indices << offset
+        if masked:
+            indices = codes
+        mask = self.dims_to_mask({dim.name})
+        dtype = 'UINT64' if masked else 'INT64'
+        vec = grblas.Vector.from_values(codes, indices, dtype=dtype, size=mask + 1)
+        return CodedArray(Flat(vec, self, (dim.name,)))
+
     def encode_one(self, **values) -> int:
         code = 0
         for name, val in values.items():
@@ -102,7 +140,7 @@ class Schema:
             if val is None:
                 val = NULL
             index = dim.lookup[val]
-            offset = self._offset[name]
+            offset = self.offset[name]
             code |= index << offset
         return code
 
@@ -119,7 +157,7 @@ class Schema:
                 # Most likely a None is present; convert to NULL
                 vals = vals.where(pd.notna(vals), NULL)
                 index = self._lookup[name].val2pos[vals].values
-            offset = self._offset[name]
+            offset = self.offset[name]
             codes |= index << offset
         return codes
 
@@ -130,7 +168,7 @@ class Schema:
         for name in names:
             dim = self._lookup[name]
             mask = self.mask[name]
-            offset = self._offset[name]
+            offset = self.offset[name]
             index = (code & mask) >> offset
             values[name] = dim[index]
         return values
@@ -142,12 +180,15 @@ class Schema:
         for name in names:
             dim = self._lookup[name]
             mask = self.mask[name]
-            offset = self._offset[name]
+            offset = self.offset[name]
             index = (array & mask) >> offset
             df[name] = dim.pos2val[index].values
         return df
 
-    def dims_to_mask(self, dims: Set[str]) -> int:
+    def dims_to_mask(self, dims: Set[str] = None) -> int:
+        if dims is None:
+            return 2**self.total_bits
+
         mask = 0
         for dim in dims:
             mask |= self.mask[dim]
