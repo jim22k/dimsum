@@ -468,6 +468,104 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         vec = grblas.Vector.from_values(index, matches, dtype=bool, size=obj.vector.size)
         return CodedArray(Flat(vec, obj.schema, obj.dims))
 
+    def shift(self, dim: str, amount=1, *, agg=grblas.monoid.plus):
+        """
+        Shifts the code associated with dim by amount. Any data which shifts beyond the allowable
+        values for dim will be aggregated into the NULL value for dim. If multiple elements are shifted
+        into the same code, they will also be aggregated together using `agg`.
+
+        When providing a single integer for the amount, values with dim=NULL will *not* be shifted.
+        When providing the amount as a CodedArray, a non-zero shift value is allowed for dim=NULL.
+
+        Example:
+        >>> quarters = Dimension('Q', ['2021-Q1', '2021-Q2', '2021-Q3', '2021-Q4'])
+        >>> data = schema.encode(
+            [['sprocket', '2021-Q1', 12.5],
+             ['sprocket', '2021-Q2', 17.2],
+             ['sprocket', '2021-Q3', 11.7],
+             ['sprocket', '2021-Q4', 14.6]],
+            dims=['widget', 'Q']
+        )
+        # Supply chain disruption affects 2021-Q2; must move that back to Q3
+        >>> shifter = schema.encode({'2021-Q2': 1}, 'Q')
+        # Expand shifter to tag everything not specified as having a shift of 0 (i.e. unaffected)
+        >>> new_data = data.shift('Q', shifter.X[0])
+        >>> new_data
+            widget        Q  * value *
+        0 sprocket  2021-Q1       12.5
+        1 sprocket  2021-Q3       29.9
+        2 sprocket  2021-Q4       14.6
+
+        :param dim: dimension name or dimension object
+        :param amount: integer or CodedArray of ints
+        :param agg: aggregator to use when shifting multiple elements into the same code (default: plus)
+        :return: CodedArray
+        """
+        from . import alignment
+        from .schema import Dimension
+
+        amount_fill = None
+
+        if type(amount) is ExpandingCodedArray:
+            amount_fill = amount.fill_value
+            amount = amount.coded_array
+
+        if type(self.obj) is Pivot:
+            top_dims = self.obj.top
+            input = self.flatten().obj
+        else:
+            top_dims = None
+            input = self.obj
+
+        if type(dim) is not Dimension:
+            dim = input.schema[dim]
+        if not dim.ordered:
+            raise TypeError(f"Dimension {dim.name} must be ordered")
+        dim_name = dim.name
+        offset = input.schema.offset[dim_name]
+        mask = input.schema.dims_to_mask({dim_name})
+        max_code = int(dim.val2pos.max())
+
+        if type(amount) is CodedArray:
+            amount_orig = amount
+            amount = amount.flatten().obj
+            input, amount = alignment.align_flats(input, amount, bfill=amount_fill)
+            if type(input) is Pivot:
+                input = input.flatten()
+                amount = amount.flatten()
+            # Ensure we aren't mutating the original inputs
+            ivec = input.vector if input.vector is not self.obj.data else input.vector.dup()
+            avec = amount.vector if amount.vector is not amount_orig.obj.data else amount.vector.dup()
+            # Force exact alignment by performing ewise_mult on each
+            ivec << grblas.binary.first(ivec & avec)
+            avec << grblas.binary.second(ivec & avec)
+            index, vals = ivec.to_values()
+            codes = (index & mask) >> offset
+            codes = codes.astype(np.int64)
+            shift_idx, shift_vals = avec.to_values()
+            assert (index == shift_idx).all(), 'different indexes'
+            codes += shift_vals
+        else:
+            index, vals = input.vector.to_values()
+            codes = (index & mask) >> offset
+            codes = codes.astype(np.int64)
+            nulls = codes == 0
+            codes[~nulls] += amount
+
+        # Adjust out-of-range codes to NULL
+        out_of_range = (codes < 0) | (codes > max_code)
+        codes[out_of_range] = 0
+        codes = codes.astype(np.uint64)
+        # Assign shifted codes back into index
+        index &= ~np.uint64(mask)
+        index |= (codes << offset)
+        # Build output from shifted indices, aggregating duplicates in the process
+        vector = grblas.Vector.from_values(index, vals, dup_op=agg)
+        output = Flat(vector, input.schema, input.dims)
+        if top_dims is not None:
+            output = output.pivot(top=top_dims)
+        return CodedArray(output)
+
     def apply(self, op, *, left=None, right=None, inplace=False):
         if type(self.obj) is Flat:
             vec = self.obj.vector.apply(op, left=left, right=right)
