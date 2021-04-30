@@ -566,7 +566,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             output = output.pivot(top=top_dims)
         return CodedArray(output)
 
-    def apply(self, op, *, left=None, right=None, inplace=False):
+    def _apply(self, op, *, left=None, right=None, inplace=False):
         if type(self.obj) is Flat:
             vec = self.obj.vector.apply(op, left=left, right=right)
             if inplace:
@@ -613,17 +613,72 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         return CodedArray(result)
 
     def reduce_rows(self, op=_reduce_op_default):
+        """
+        Perform a row-wise reduction. Only the left dimensions will remain in the result.
+        """
         if type(self.obj) is not Pivot:
             raise TypeError("reduce_rows can only be used for pivoted CodedArrays")
         return CodedArray(self.obj.reduce_rows(op))
 
     def reduce_columns(self, op=_reduce_op_default):
+        """
+        Perform a column-wise reduction. Only the top dimensions will remain in the result.
+        """
         if type(self.obj) is not Pivot:
             raise TypeError("reduce_columns can only be used for pivoted CodedArrays")
         return CodedArray(self.obj.reduce_columns(op))
 
     def reduce(self, op=_reduce_op_default):
+        """
+        Perform a full reduction to a scalar value
+        """
         return self.obj.reduce(op)
+
+    def align(self, other):
+        """
+        Aligns `self` with `other`.
+
+        To expand the shape to match `other`, use `my_obj.X[fill_val].align(other)`.
+        To avoid losing any mismatching items, use `my_obj.align(other.X)`
+
+        Returns the aligned version of `self`
+        """
+        from .methods import align
+
+        ret, _ = align(self, other)
+        return ret
+
+    def cross_align(self, other, dims=None):
+        """
+        Performs cross-alignment with `other` by first removing `dims` from `other`
+        and then aligning with the now disjoint dimensions.
+
+        If dims are not provided, all matching dimensions between `self` and `other`
+        are used.
+        If dims are provided, they must exist in `other`.
+        """
+        if type(other) is ExpandingCodedArray:
+            fill_value = other.fill_value
+            other = other.coded_array
+        else:
+            fill_value = None
+
+        if dims is None:
+            dims = self.obj.dims & other.obj.dims
+        elif dims - other.obj.dims:
+            raise TypeError(f'Provided dims not found in other: {dims - other.obj.dims}')
+
+        if dims == other.obj.dims:
+            # Other will become a scalar, so nothing to align with
+            return self
+
+        # Remove dims from other
+        gutted = CodedArray(other.obj.pivot(top=dims).reduce_rows(grblas.monoid.any))
+
+        if fill_value is not None:
+            gutted = ExpandingCodedArray(gutted)
+
+        return self.align(gutted)
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         return CodedArray._ufunc_handler(ufunc, method, *inputs, **kwargs)
@@ -667,7 +722,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
                 # ex. np.sin(a) or np.sin(a.X)
                 assert nscalar == 0, f"unexpected input to {func_name}"
                 assert narray == 1, f"unexpected input to {func_name}"
-                ret = args[0].apply(gbfunc)
+                ret = args[0]._apply(gbfunc)
                 if fills[0] is not None:
                     return ExpandingCodedArray(ret, fill_value=fills[0])
                 return ret
@@ -676,10 +731,10 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
                 assert nscalar == 1, f"unexpected input to {func_name}"
                 assert narray == 1, f"unexpected input to {func_name}"
                 if isinstance(args[0], Number):
-                    ret = args[1].apply(gbfunc, left=args[0])
+                    ret = args[1]._apply(gbfunc, left=args[0])
                     fill = fills[1]
                 else:
-                    ret = args[0].apply(gbfunc, right=args[1])
+                    ret = args[0]._apply(gbfunc, right=args[1])
                     fill = fills[0]
                 if fill is not None:
                     return ExpandingCodedArray(ret, fill_value=fill)
@@ -703,21 +758,23 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
 
 class ExpandingCodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
-    def __init__(self, coded_array, fill_value=0):
+    def __init__(self, coded_array: CodedArray, fill_value:Number = 0):
         self.coded_array = coded_array
         if not isinstance(fill_value, Number):
             raise TypeError(f"fill_value must be a scalar number, not {type(fill_value)}")
         self.fill_value = fill_value
 
     def __getitem__(self, fill_value):
-        if isinstance(fill_value, CodedArray):
-            from . import alignment
-
-            # An ExpandingCodedArray expanding like another CodedArray has all the information
+        if isinstance(fill_value, (CodedArray, ExpandingCodedArray)):
+            # An ExpandingCodedArray with a fill value of a CodedArray has all the information
             # needed to fully realize itself back into a CodedArray
-            ret, _ = alignment.align(self.coded_array.obj, fill_value.obj, afill=fill_value.obj)
-            return CodedArray(ret)
-        elif isinstance(fill_value, (int, float, bool)):
+            from .alignment import _fill_like
+
+            # Set the fill value to be whatever the values are in the other object
+            self.fill_value = _fill_like
+
+            return self.align(fill_value)
+        elif isinstance(fill_value, Number):
             # Return a new ExpandingCodedArray, this time with the fill value included
             return ExpandingCodedArray(self.coded_array, fill_value=fill_value)
         else:
@@ -726,5 +783,12 @@ class ExpandingCodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         return CodedArray._ufunc_handler(ufunc, method, *inputs, **kwargs)
 
+    # This is useful if `cond` contains codes not found in the coded_array
     def filter(self, cond):
         return self.coded_array.filter(cond, _afill=self.fill_value)
+
+    def align(self, other):
+        from .methods import align
+
+        ret, _ = align(self, other)
+        return ret

@@ -3,7 +3,45 @@ from numbers import Number
 from .container import Flat, Pivot, CodedArray, ExpandingCodedArray
 
 
-__all__ = ['where']
+__all__ = ['align', 'where', 'full_like', 'ones_like', 'zeros_like']
+
+
+def align(x, y, exact=True):
+    """
+    Aligns two CodedArrays or their expanding forms
+
+    Exact alignment means the returned objects will have exactly the same shape and number of elements.
+    With exact alignment, elements of x or y will be dropped if they do not have a matching code in the
+    other object and the other object is not expanding (ex. y.X).
+    With exact_alignment turned off, no elements from x or y will be lost in the alignment, but the final
+    shapes and number of elements may differ.
+
+    :param x: CodedArray or ExpandingCodedArray
+    :param y: CodedArray or ExpandingCodedArray
+    :param exact: (default True) whether to force exact alignment
+    :return: Tuple[CodedArray, CodedArray]
+    """
+    from .alignment import align
+
+    xfill = None
+    if type(x) is ExpandingCodedArray:
+        xfill = x.fill_value
+        x = x.coded_array
+
+    yfill = None
+    if type(y) is ExpandingCodedArray:
+        yfill = y.fill_value
+        y = y.coded_array
+
+    ax, ay = align(x.obj, y.obj, afill=xfill, bfill=yfill)
+
+    if exact:
+        if xfill is None:
+            ay.data(ax.data.S, replace=True) << ay.data
+        if yfill is None:
+            ax.data(ay.data.S, replace=True) << ax.data
+
+    return CodedArray(ax), CodedArray(ay)
 
 
 def where(cond, true_vals, false_vals):
@@ -60,3 +98,39 @@ def where(cond, true_vals, false_vals):
 
     # There should be no overlap, so add using outer-join to combine
     return true_merge.X + false_merge.X
+
+
+def full_like(obj, fill_value, dtype=None):
+    """
+    Return a new CodedArray with all values filled in with `fill_value`.
+
+    If dtype is not provided, it inherits the same dtype as `obj`.
+
+    :param obj: CodedArray
+    :param fill_value: scalar
+    :param dtype: dtype, default is same as obj's dtype
+    :return: CodedArray
+    """
+    # Grab the Flat or Pivot out of the CodedArray
+    obj = obj.obj
+
+    if dtype is None:
+        dtype = obj.data.dtype
+
+    if type(obj) is Flat:
+        vec = obj.vector.dup(dtype=dtype)
+        vec(vec.S) << fill_value
+        result = Flat(vec, obj.schema, obj.dims)
+    else:
+        mat = obj.matrix.dup(dtype=dtype)
+        mat(mat.S) << fill_value
+        result = Pivot(mat, obj.schema, obj.left, obj.top)
+    return CodedArray(result)
+
+
+def zeros_like(obj, dtype=None):
+    return full_like(obj, 0, dtype=dtype)
+
+
+def ones_like(obj, dtype=None):
+    return full_like(obj, 1, dtype=dtype)
