@@ -1,4 +1,5 @@
 import math
+from collections.abc import Mapping
 from typing import Set, Tuple, List, Union, Optional, Iterable
 import numpy as np
 import pandas as pd
@@ -14,7 +15,7 @@ class SchemaMismatchError(Exception):
 
 
 class Dimension:
-    def __init__(self, name, allowed_values, ordered=True):
+    def __init__(self, name, allowed_values, *, ordered=True):
         self.name = name
         self.ordered = ordered
 
@@ -67,7 +68,7 @@ class Dimension:
             return [self.lookup[x] for x in data]
 
 
-class Schema:
+class Schema(Mapping):
     def __init__(self, dimensions):
         self._dimensions = tuple(dimensions)
         self.names = tuple(dim.name for dim in dimensions)
@@ -90,6 +91,12 @@ class Schema:
         if bit_pos > 60:
             raise OverflowError(f"Number of required bits {bit_pos} exceeds the maximum of 60 allowed by GraphBLAS")
         self.total_bits = bit_pos
+
+        # Add calendar if any dimensions are CalendarDimensions
+        from . import calendar
+
+        if any(isinstance(dim, calendar.CalendarDimension) for dim in self._dimensions):
+            self.calendar = calendar.Calendar(self)
 
     def __len__(self):
         return len(self._dimensions)
