@@ -44,20 +44,20 @@ def align(x, y, exact=True):
     return CodedArray(ax), CodedArray(ay)
 
 
-def where(cond, true_vals, false_vals):
+def where(cond, true_vals, false_vals=None):
     """
     Use `true_vals` where `cond` is True, `false_vals` where `cond` is False
     to build a merged dataset. The result will be empty where `cond` is empty.
 
-    If no false_vals are available and the goal is to only return values from
-    `true_vals` where `cond` is True, use `true_vals.filter(cond)` instead.
+    `false_vals` are optional and if not provided, this will behave nearly the same as
+    `true_vals.filter(cond)`.
 
     `cond` can also be a boolean scalar, in which case either true_vals or false_vals
     will be returned as-is.
 
     :param cond: boolean CodedArray or scalar
     :param true_vals: CodedArray or scalar
-    :param false_vals: CodedArray or scalar
+    :param false_vals: CodedArray or scalar (optional)
     :return: CodedArray or scalar
     """
     if type(cond) is bool:
@@ -80,7 +80,7 @@ def where(cond, true_vals, false_vals):
     # Get values from false_vals where cond==False
     # It is okay to mutate cond in this block because no further usages exist below
     if false_vals is None:
-        raise TypeError('false_vals cannot be None')
+        return true_merge
     elif isinstance(false_vals, Number):
         if type(cond) is ExpandingCodedArray:
             # Expanding a condition against a scalar makes no sense, so ignore

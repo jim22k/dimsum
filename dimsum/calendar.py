@@ -43,12 +43,13 @@ class Calendar(Mapping):
         self._schema = schema
 
         # Find all dimensions which are CalendarDimensions
-        freqs = set()
+        freqs = {}
         for dim in schema._dimensions:
             if isinstance(dim, CalendarDimension):
                 if dim.freq in freqs:
                     raise DuplicateFrequencyError(f'Found more than one CalendarDimension with frequency={dim.freq}')
                 self._dimensions[dim.name] = dim
+                freqs[dim.freq] = dim.name
 
         self._build_mappings(schema, freqs)
 
@@ -62,6 +63,10 @@ class Calendar(Mapping):
         return len(self._mappings)
 
     def _build_mappings(self, schema, freqs):
+        from .methods import where
+
+        map = self._mappings
+
         # Data object holds (name, dims, codes, values, dtype)
         data = []
 
@@ -105,10 +110,32 @@ class Calendar(Mapping):
                 data.append((f'{name}.year', [name], codes, index.year, 'int32'))
                 data.append((f'{name}.days_in_year', [name], codes, index.dayofyear, 'int16'))
 
-            # Build all possible mappings
-            pass
-
         # Wrap objects as CodedArrays
         for name, dims, codes, values, dtype in data:
             vec = Vector.from_values(codes, values, dtype=dtype)
-            self._mappings[name] = CodedArray(Flat(vec, schema, dims))
+            map[name] = CodedArray(Flat(vec, schema, dims))
+
+        # Build all possible mappings
+        d = freqs.get('D')
+        m = freqs.get('M')
+        q = freqs.get('Q-DEC')
+        y = freqs.get('A-DEC')
+
+        if d is not None and m is not None:
+            criteria = (map[f'{d}.month'] == map[f'{m}.month']) & (map[f'{d}.year'] == map[f'{m}.year'])
+            map[f'{d}->{m}'] = where(criteria, 1)
+        if d is not None and q is not None:
+            criteria = (map[f'{d}.quarter'] == map[f'{q}.quarter']) & (map[f'{d}.year'] == map[f'{q}.year'])
+            map[f'{d}->{q}'] = where(criteria, 1)
+        if d is not None and y is not None:
+            criteria = map[f'{d}.year'] == map[f'{y}.year']
+            map[f'{d}->{y}'] = where(criteria, 1)
+        if m is not None and q is not None:
+            criteria = (map[f'{m}.quarter'] == map[f'{q}.quarter']) & (map[f'{m}.year'] == map[f'{q}.year'])
+            map[f'{m}->{q}'] = where(criteria, 1)
+        if m is not None and y is not None:
+            criteria = map[f'{m}.year'] == map[f'{y}.year']
+            map[f'{m}->{y}'] = where(criteria, 1)
+        if q is not None and y is not None:
+            criteria = map[f'{q}.year'] == map[f'{y}.year']
+            map[f'{q}->{y}'] = where(criteria, 1)
