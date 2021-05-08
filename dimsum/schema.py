@@ -20,34 +20,38 @@ class Dimension:
         self.ordered = ordered
 
         values = tuple(allowed_values)
-        lookup = {v: i for i, v in enumerate(values, 1)}
+        valset = set(values)
+
+        if len(valset) < len(values):
+            from collections import Counter
+
+            c = Counter(values)
+            dups = {k: v for k, v in c.items() if v > 1}
+            raise ValueError(f"Duplicate values: {dups}")
 
         if len(values) <= 0:
             raise ValueError("allowed_values is empty")
 
-        if len(lookup) < len(values):
-            raise ValueError("duplicate values")
-
-        if None in lookup:
+        if None in valset:
             raise ValueError("`None` is not an allowable value")
 
-        if NULL in lookup:
+        if NULL in valset:
             raise ValueError("NULL (∅) is not an allowable value")
 
         # Add in NULL key (Python `None`), always at the zero bit value
         values = (NULL,) + values
-        lookup[NULL] = 0
 
-        self.values = values
-        self.lookup = lookup
-        self.pos2val = pd.Series(values)
-        self.val2pos = pd.Series(lookup, dtype=np.uint64)
+        self.values = pd.Series(values)
+        self.enums = pd.Series(np.arange(len(values), dtype=np.uint64), index=values)
         self.num_bits = math.ceil(math.log2(len(values)))
 
     def __eq__(self, other):
         if type(other) is not Dimension:
             return NotImplemented
-        return self.values == other.values
+        try:
+            return (self.values == other.values).all()
+        except ValueError:
+            return False
 
     def __len__(self):
         return len(self.values)
@@ -55,17 +59,11 @@ class Dimension:
     def __getitem__(self, index):
         return self.values[index]
 
-    def encode(self, data):
+    def enumerate(self, data):
         """
-        Converts codes into indices
-
-        :param data: pd.Series or iterable
-        :return: pd.Series or list
+        Converts values into indices
         """
-        if isinstance(data, pd.Series):
-            return self.val2pos[data]
-        else:
-            return [self.lookup[x] for x in data]
+        return data.__class__(self.enums[data])
 
 
 class Schema(Mapping):
@@ -78,14 +76,14 @@ class Schema(Mapping):
             raise ValueError("duplicate dimension names")
 
         self.offset = {}
-        self.mask = {}
+        self.bitmask = {}
 
         # Populate offsets and masks
         # Use reverse order to make sorting follow first indicated dimension
         bit_pos = 0
         for dim in reversed(self._dimensions):
             self.offset[dim.name] = bit_pos
-            self.mask[dim.name] = (2**dim.num_bits - 1) << bit_pos
+            self.bitmask[dim.name] = (2**dim.num_bits - 1) << bit_pos
             bit_pos += dim.num_bits
 
         if bit_pos > 60:
@@ -112,16 +110,16 @@ class Schema(Mapping):
     def __repr__(self):
         r = ['Schema:']
         for dim in self._dimensions:
-            r.append(f"  {self.mask[dim.name]:0{self.total_bits}b} {dim.name}")
+            r.append(f"  {self.bitmask[dim.name]:0{self.total_bits}b} {dim.name}")
         return '\n'.join(r)
 
-    def dimension_indices(self, dim, masked=False):
+    def dimension_enums(self, dim):
         """
         Returns a new CodedArray containing all values of `dim` and the associated enumerations for each code
 
         >>> size = Dimension('size', ['small', 'medium', 'large'])
         >>> schema = Schema(['size', ...])
-        >>> schema.dimension_indices('size')
+        >>> schema.dimension_enums('size')
             size  * values *
         0      ∅           0
         1  small           1
@@ -131,27 +129,44 @@ class Schema(Mapping):
         if not isinstance(dim, Dimension):
             dim = self[dim]
         offset = self.offset[dim.name]
-        indices = dim.val2pos.values
-        codes = indices << offset
-        if masked:
-            indices = codes
-        mask = self.dims_to_mask({dim.name})
-        dtype = 'UINT64' if masked else 'INT64'
-        vec = grblas.Vector.from_values(codes, indices, dtype=dtype, size=mask + 1)
+        enums = dim.enums.values
+        codes = enums << offset
+        mask = self.bitmask[dim.name]
+        vec = grblas.Vector.from_values(codes, enums, dtype='INT64', size=mask + 1)
         return CodedArray(Flat(vec, self, (dim.name,)))
 
-    def encode_one(self, **values) -> int:
+    def encode(self, **values) -> int:
+        """
+        Pass dim1=value, dim2=value, ... to build the associated code
+        """
         code = 0
         for name, val in values.items():
             dim = self._lookup[name]
             if val is None:
                 val = NULL
-            index = dim.lookup[val]
+            index = int(dim.enums[val])
             offset = self.offset[name]
             code |= index << offset
         return code
 
-    def encode_many(self, values: pd.DataFrame) -> np.ndarray:
+    def decode(self, code, names: Optional[Tuple[str]] = None) -> dict:
+        """
+        Builds a dict of dim_name: value from a code.
+
+        Passing names will limit to output to only those dimensions.
+        """
+        if names is None:
+            names = self.names
+        values = {}
+        for name in names:
+            dim = self._lookup[name]
+            mask = self.bitmask[name]
+            offset = self.offset[name]
+            index = (code & mask) >> offset
+            values[name] = dim[index]
+        return values
+
+    def _encode_from_df(self, values: pd.DataFrame) -> np.ndarray:
         """
         DataFrame headers must match Dimension names exactly
         """
@@ -159,52 +174,46 @@ class Schema(Mapping):
         for name in values.columns:
             vals = values[name]
             try:
-                index = self._lookup[name].val2pos[vals].values
+                index = self._lookup[name].enums[vals].values
             except ValueError:
                 # Most likely a None is present; convert to NULL
                 vals = vals.where(pd.notna(vals), NULL)
-                index = self._lookup[name].val2pos[vals].values
+                index = self._lookup[name].enums[vals].values
             offset = self.offset[name]
             codes |= index << offset
         return codes
 
-    def decode_one(self, code, names: Optional[Tuple[str]] = None) -> dict:
-        if names is None:
-            names = self.names
-        values = {}
-        for name in names:
-            dim = self._lookup[name]
-            mask = self.mask[name]
-            offset = self.offset[name]
-            index = (code & mask) >> offset
-            values[name] = dim[index]
-        return values
-
-    def decode_many(self, array: np.ndarray, names: Optional[Iterable[str]] = None) -> pd.DataFrame:
+    def _decode_to_df(self, array: np.ndarray, names: Optional[Iterable[str]] = None) -> pd.DataFrame:
         if names is None:
             names = self.names
         df = pd.DataFrame()
         for name in names:
             dim = self._lookup[name]
-            mask = self.mask[name]
+            mask = self.bitmask[name]
             offset = self.offset[name]
             index = (array & mask) >> offset
-            df[name] = dim.pos2val[index].values
+            df[name] = dim.values[index].values
         return df
 
-    def dims_to_mask(self, dims: Set[str] = None) -> int:
+    def build_bitmask(self, dims: Set[str] = None) -> int:
+        """
+        Builds a bitmask from a set of dimensions.
+        """
         if dims is None:
             return 2**self.total_bits
 
         mask = 0
         for dim in dims:
-            mask |= self.mask[dim]
+            mask |= self.bitmask[dim]
         return mask
 
-    def mask_to_dims(self, mask: int) -> Set[str]:
-        return {dim for dim in self.mask if mask & self.mask[dim]}
+    def deconstruct_bitmask(self, bitmask: int) -> Set[str]:
+        """
+        Returns a set of dimension names which correspond to the bitmask
+        """
+        return {dim for dim in self.bitmask if bitmask & self.bitmask[dim]}
 
-    def encode(self, data, dims: List[str] = None, value_column: str = None) -> CodedArray:
+    def load(self, data, dims: List[str] = None, value_column: str = None) -> CodedArray:
         """
         Converts `data` to a CodedArray. `data` may be one of:
         - pd.DataFrame

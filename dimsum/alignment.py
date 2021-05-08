@@ -296,7 +296,7 @@ def _align_partial_disjoint(x: Pivot, y: Pivot, op=None, afill=None, bfill=None)
     assert x.left == y.left
     matched_dims = x.left
     mismatched_dims = x.top | y.top
-    top_mask = x.schema.dims_to_mask(mismatched_dims)
+    top_mask = x.schema.build_bitmask(mismatched_dims)
 
     # Compute the size and offsets of the cross join computation
     x1 = x.matrix.apply(grblas.unary.one).new().reduce_rows(grblas.monoid.plus['INT64']).new()

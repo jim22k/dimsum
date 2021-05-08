@@ -88,8 +88,8 @@ class Flat:
             raise ValueError("top dimensions are empty")
 
         # Perform pivot
-        left_mask = self.schema.dims_to_mask(left)
-        top_mask = self.schema.dims_to_mask(top)
+        left_mask = self.schema.build_bitmask(left)
+        top_mask = self.schema.build_bitmask(top)
         index, vals = self.vector.to_values()
         rows = index & left_mask
         cols = index & top_mask
@@ -113,7 +113,7 @@ class Flat:
         :param value_column: str column header (optional)
         :return: Flat
         """
-        index = schema.encode_many(df[dims])
+        index = schema._encode_from_df(df[dims])
         if value_column is None:
             remaining_cols = df.columns.difference(dims)
             if len(remaining_cols) > 1:
@@ -122,7 +122,7 @@ class Flat:
                 raise TypeError("no value column found")
             value_column = remaining_cols[0]
         vals = df[value_column].values
-        dim_mask = schema.dims_to_mask(dims)
+        dim_mask = schema.build_bitmask(dims)
         vec = grblas.Vector.from_values(index, vals, size=dim_mask + 1)
         return cls(vec, schema, dims)
 
@@ -190,7 +190,7 @@ class Flat:
         :return: pd.DataFrame
         """
         index, vals = self.vector.to_values()
-        df = self.schema.decode_many(index, self.dims_list)
+        df = self.schema._decode_to_df(index, self.dims_list)
         df[value_column] = vals
         return df
 
@@ -228,7 +228,7 @@ class Pivot:
         rows, cols, vals = self.matrix.to_values()
         index = rows | cols
         combo_dims = self.left | self.top
-        dim_mask = self.schema.dims_to_mask(combo_dims)
+        dim_mask = self.schema.build_bitmask(combo_dims)
         vector = grblas.Vector.from_values(index, vals, size=dim_mask + 1)
         return Flat(vector, self.schema, combo_dims)
 
@@ -260,8 +260,8 @@ class Pivot:
             return self
 
         # Perform pivot
-        left_mask = self.schema.dims_to_mask(left)
-        top_mask = self.schema.dims_to_mask(top)
+        left_mask = self.schema.build_bitmask(left)
+        top_mask = self.schema.build_bitmask(top)
         orig_rows, orig_cols, vals = self.matrix.to_values()
         index = orig_rows | orig_cols
         rows = index & left_mask
@@ -286,8 +286,8 @@ class Pivot:
         rows, cols, vals = self.matrix.to_values()
         row_unique, row_reverse = np.unique(rows, return_inverse=True)
         col_unique, col_reverse = np.unique(cols, return_inverse=True)
-        row_index = self.schema.decode_many(row_unique, left_dims).set_index(left_dims).index
-        col_index = self.schema.decode_many(col_unique, top_dims).set_index(top_dims).index
+        row_index = self.schema._decode_to_df(row_unique, left_dims).set_index(left_dims).index
+        col_index = self.schema._decode_to_df(col_unique, top_dims).set_index(top_dims).index
         df = pd.DataFrame(index=row_index, columns=col_index)
         df.values[row_reverse, col_reverse] = vals
         df = df.where(pd.notnull(df), "")
@@ -305,6 +305,10 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
     def _repr_html_(self):
         return self.obj._repr_html_()
+
+    @property
+    def schema(self):
+        return self.obj.schema
 
     @property
     def dims(self):
@@ -408,6 +412,8 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         """
         return self.obj.to_dataframe()
 
+    # TODO: add to_dict, to_lists; rearrange where `schema` is in the from_* methods
+
     def flatten(self) -> "CodedArray":
         if type(self.obj) is Flat:
             return self
@@ -416,7 +422,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
     def pivot(self, left: Optional[Set[str]] = None, top: Optional[Set[str]] = None) -> "CodedArray":
         return CodedArray(self.obj.pivot(left=left, top=top))
 
-    def get_code(self, *dims):
+    def codes(self, *dims):
         """
         Returns the numeric code for every element, masked by dims
         If no dims are provided, the full code is returned
@@ -425,12 +431,12 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         if not dims:
             dims = obj.dims
         index, _ = obj.vector.to_values()
-        mask = obj.schema.dims_to_mask(dims)
+        mask = obj.schema.build_bitmask(dims)
         codes = index & mask
         vec = grblas.Vector.from_values(index, codes, dtype='INT64', size=obj.vector.size)
         return CodedArray(Flat(vec, obj.schema, obj.dims))
 
-    def has_code(self, **kwargs):
+    def match(self, **kwargs):
         """
         Returns a boolean CodedArray indicating whether each element matches this code.
 
@@ -446,7 +452,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         obj = self.flatten().obj
         schema = obj.schema
         dims = list(kwargs.keys())
-        mask = schema.dims_to_mask(dims)
+        mask = schema.build_bitmask(dims)
         index, _ = obj.vector.to_values()
         codes = index & mask
         # Normalize input values
@@ -456,8 +462,10 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             offset = schema.offset[dim_name]
             vals = kwargs[dim_name]
             if not isinstance(vals, (list, tuple, set)):
-                vals = (vals,)
-            vals = [dim.lookup[val] << offset for val in vals]
+                vals = [vals]
+            else:
+                vals = list(vals)
+            vals = dim.enums[vals].values << offset
             normalized.append(vals)
         # Test combo pairs
         matches = np.zeros_like(codes, dtype=bool)
@@ -479,7 +487,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
         Example:
         >>> quarters = Dimension('Q', ['2021-Q1', '2021-Q2', '2021-Q3', '2021-Q4'])
-        >>> data = schema.encode(
+        >>> data = schema.load(
             [['sprocket', '2021-Q1', 12.5],
              ['sprocket', '2021-Q2', 17.2],
              ['sprocket', '2021-Q3', 11.7],
@@ -487,7 +495,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             dims=['widget', 'Q']
         )
         # Supply chain disruption affects 2021-Q2; must move that back to Q3
-        >>> shifter = schema.encode({'2021-Q2': 1}, 'Q')
+        >>> shifter = schema.load({'2021-Q2': 1}, 'Q')
         # Expand shifter to tag everything not specified as having a shift of 0 (i.e. unaffected)
         >>> new_data = data.shift('Q', shifter.X[0])
         >>> new_data
@@ -523,8 +531,8 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             raise TypeError(f"Dimension {dim.name} must be ordered")
         dim_name = dim.name
         offset = input.schema.offset[dim_name]
-        mask = input.schema.dims_to_mask({dim_name})
-        max_code = int(dim.val2pos.max())
+        mask = input.schema.build_bitmask({dim_name})
+        max_code = int(dim.enums.max())
 
         if type(amount) is CodedArray:
             amount_orig = amount
