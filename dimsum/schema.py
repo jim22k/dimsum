@@ -59,11 +59,16 @@ class Dimension:
     def __getitem__(self, index):
         return self.values[index]
 
+    def __repr__(self):
+        return f"Dimension<{self.name}>"
+
     def enumerate(self, data):
         """
-        Converts values into indices
+        Converts values into an array of indices
         """
-        return data.__class__(self.enums[data])
+        if not isinstance(data, pd.Series):
+            data = list(data)
+        return self.enums[data].values
 
 
 class Schema(Mapping):
@@ -179,6 +184,10 @@ class Schema(Mapping):
                 # Most likely a None is present; convert to NULL
                 vals = vals.where(pd.notna(vals), NULL)
                 index = self._lookup[name].enums[vals].values
+            except KeyError:
+                dim = self._lookup[name]
+                missing = list(dim.enums.index.union(vals).difference(dim.enums.index))
+                raise KeyError(f"{dim.name} does not have value(s): {missing}")
             offset = self.offset[name]
             codes |= index << offset
         return codes

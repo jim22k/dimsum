@@ -112,7 +112,8 @@ class Calendar(Mapping):
 
         # Wrap objects as CodedArrays
         for name, dims, codes, values, dtype in data:
-            vec = Vector.from_values(codes, values, dtype=dtype)
+            bitmask = schema.build_bitmask(dims)
+            vec = Vector.from_values(codes, values, size=bitmask + 1, dtype=dtype)
             map[name] = CodedArray(Flat(vec, schema, dims))
 
         # Build all possible mappings

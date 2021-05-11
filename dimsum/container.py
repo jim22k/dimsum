@@ -215,6 +215,9 @@ class Pivot:
             df = self.to_dataframe()
             return df._repr_html_()
 
+    def __len__(self):
+        return self.matrix.nvals
+
     @property
     def data(self):
         return self.matrix
@@ -305,6 +308,9 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
     def _repr_html_(self):
         return self.obj._repr_html_()
+
+    def __len__(self):
+        return len(self.obj)
 
     @property
     def schema(self):
@@ -552,7 +558,7 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
             codes = codes.astype(np.int64)
             shift_idx, shift_vals = avec.to_values()
             assert (index == shift_idx).all(), 'different indexes'
-            codes += shift_vals
+            codes += shift_vals.astype(int)
         else:
             index, vals = input.vector.to_values()
             codes = (index & mask) >> offset
