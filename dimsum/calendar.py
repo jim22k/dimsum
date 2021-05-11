@@ -27,7 +27,7 @@ class CalendarDimension(Dimension):
             raise TypeError(f'periods must be a pd.PeriodIndex, not {type(periods)}')
 
         if format is None:
-            values = periods.to_native_types()
+            values = periods.astype(str)
         else:
             values = periods.strftime(format)
         self.freq = periods.freqstr

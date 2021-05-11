@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="dimsum",
-    version="0.0.1",
+    version="0.1.0",
     author="Jim Kitchen and Erik Welch",
     description="Relational operations built on GraphBLAS",
     long_description=long_description,
