@@ -168,12 +168,7 @@ def _already_aligned_flats(a: Flat, b: Flat, op=None, afill=None, bfill=None) ->
         return Flat(a2, a.schema, a.dims), Flat(b2, b.schema, b.dims)
     else:
         result = a2.ewise_mult(b2, op=op)
-        # Save result over a2, but don't modify the original input
-        if afill is None:
-            a2 = result.new()
-        else:
-            a2 << result
-        return Flat(a2, a.schema, a.dims)
+        return Flat(result.new(), a.schema, a.dims)
 
 
 def _already_aligned_pivots(a: Pivot, b: Pivot, op=None, afill=None, bfill=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:
@@ -206,12 +201,7 @@ def _already_aligned_pivots(a: Pivot, b: Pivot, op=None, afill=None, bfill=None)
         return Pivot(a2, a.schema, a.left, a.top), Pivot(b2, b.schema, b.left, b.top)
     else:
         result = a2.ewise_mult(b2, op=op)
-        # Save result over a2, but don't modify the original input
-        if afill is None:
-            a2 = result.new()
-        else:
-            a2 << result
-        return Pivot(a2, a.schema, a.left, a.top)
+        return Pivot(result.new(), a.schema, a.left, a.top)
 
 
 def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed=False) -> Union[Pivot, Tuple[Pivot, Pivot]]:
@@ -258,12 +248,7 @@ def _align_subset(x: Pivot, sub: Flat, op=None, afill=None, bfill=None, reversed
         return (y, x) if reversed else (x, y)
     else:
         result = y2.ewise_mult(x2, op=op) if reversed else x2.ewise_mult(y2, op=op)
-        # Save result over x2, but don't modify the original input
-        if afill is None:
-            x2 = result.new()
-        else:
-            x2 << result
-        return Pivot(x2, x.schema, x.left, x.top)
+        return Pivot(result.new(), x.schema, x.left, x.top)
 
 
 def _align_fully_disjoint(x: Flat, y: Flat, op=None) -> Union[Pivot, Tuple[Pivot, Pivot]]:

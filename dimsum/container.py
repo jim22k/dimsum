@@ -679,8 +679,14 @@ class CodedArray(numpy.lib.mixins.NDArrayOperatorsMixin):
 
         if dims is None:
             dims = self.obj.dims & other.obj.dims
-        elif dims - other.obj.dims:
-            raise TypeError(f'Provided dims not found in other: {dims - other.obj.dims}')
+        else:
+            if isinstance(dims, str):
+                dims = {dims}
+            else:
+                dims = set(dims)
+            unexpected_dims = dims - other.obj.dims
+            if unexpected_dims:
+                raise TypeError(f'Provided dims not found in other: {unexpected_dims}')
 
         if dims == other.obj.dims:
             # Other will become a scalar, so nothing to align with
