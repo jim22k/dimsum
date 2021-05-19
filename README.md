@@ -1,4 +1,6 @@
-# Dimsum
+### ~~~ Come Join a Table! ~~~
+
+# Dimsum 🥟
 
 Library built on top of GraphBLAS to behave more like a DataFrame than a Matrix.
 
